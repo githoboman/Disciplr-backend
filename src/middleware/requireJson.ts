@@ -1,4 +1,4 @@
-import type { NextFunction, Request, Response } from 'express'
+import { Request, Response, NextFunction } from 'express'
 
 /**
  * Middleware that enforces Content-Type: application/json for requests with bodies.
@@ -20,8 +20,8 @@ export const requireJson = (req: Request, res: Response, next: NextFunction) => 
   }
 
   // Check if the request has a body (Content-Length header or body property)
-  const hasBody = req.headers['content-length'] && 
-                  parseInt(req.headers['content-length'], 10) > 0
+  const contentLength = req.headers['content-length']
+  const hasBody = contentLength && parseInt(contentLength, 10) > 0
 
   // If there's no body, allow the request to proceed
   if (!hasBody) {
