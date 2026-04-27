@@ -27,12 +27,12 @@ describe('envSchema', () => {
     expect(env.NODE_ENV).toBe('development')
     expect(env.PORT).toBe(3000)
     expect(env.SERVICE_NAME).toBe('disciplr-backend')
-    expect(env.JWT_SECRET).toBe('change-me-in-production')
-    expect(env.JWT_ACCESS_SECRET).toBe('fallback-access-secret')
-    expect(env.JWT_REFRESH_SECRET).toBe('fallback-refresh-secret')
+    expect(env.JWT_SECRET).toBe('change-me-in-production-long-secret')
+    expect(env.JWT_ACCESS_SECRET).toBe('fallback-access-secret-long')
+    expect(env.JWT_REFRESH_SECRET).toBe('fallback-refresh-secret-long')
     expect(env.JWT_ACCESS_EXPIRES_IN).toBe('15m')
     expect(env.JWT_REFRESH_EXPIRES_IN).toBe('7d')
-    expect(env.DOWNLOAD_SECRET).toBe('change-me-in-production')
+    expect(env.DOWNLOAD_SECRET).toBe('change-me-in-production-long-secret')
     expect(env.RETRY_MAX_ATTEMPTS).toBe(3)
     expect(env.RETRY_BACKOFF_MS).toBe(100)
     expect(env.HORIZON_SHUTDOWN_TIMEOUT_MS).toBe(30_000)
@@ -296,18 +296,20 @@ describe('CORS_ORIGINS format validation', () => {
     expect(result.success).toBe(true)
   })
 
-  it('should accept any non-empty, non-wildcard origin string', () => {
-    // The schema validates structure (not URL format) — URL format is enforced by parseCorsOrigins.
+  it('should reject a non-http:// origin', () => {
     const result = envSchema.safeParse({ ...validEnv, CORS_ORIGINS: 'not-a-url' })
-    expect(result.success).toBe(true)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('CORS_ORIGINS')
+    }
   })
 
-  it('should accept any non-wildcard comma-separated list', () => {
+  it('should reject a list where one entry does not start with http://', () => {
     const result = envSchema.safeParse({
       ...validEnv,
       CORS_ORIGINS: 'https://valid.example.com,not-valid',
     })
-    expect(result.success).toBe(true)
+    expect(result.success).toBe(false)
   })
 
   it('should reject an empty string for CORS_ORIGINS', () => {
