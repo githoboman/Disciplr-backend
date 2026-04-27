@@ -1,11 +1,34 @@
 import { xdr, scValToNative } from '@stellar/stellar-sdk'
-import { 
-  ParsedEvent, 
-  EventType, 
-  VaultEventPayload, 
-  MilestoneEventPayload, 
-  ValidationEventPayload 
+import {
+  ParsedEvent,
+  EventType,
+  VaultEventPayload,
+  MilestoneEventPayload,
+  ValidationEventPayload,
 } from '../types/horizonSync.js'
+
+type DecodedPayload = Record<string, unknown>
+
+function decodePayloadRecord(xdrData: string): DecodedPayload | null {
+  const candidates = [xdrData]
+  try {
+    const decoded = Buffer.from(xdrData, 'base64').toString('utf8')
+    if (decoded && decoded !== xdrData) candidates.push(decoded)
+  } catch {
+    // ignore invalid base64
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as DecodedPayload
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return null
+}
 
 /**
  * Schema validation result
@@ -114,35 +137,20 @@ export interface HorizonEvent {
 /**
  * Validates vault_created event payload
  */
-function validateVaultCreatedPayload(payload: VaultEventPayload): ValidationResult {
+function validateVaultCreatedPayload(payload: VaultEventPayload): string | null {
   const allowedFields = [
-    'vaultId', 'creator', 'amount', 'startTimestamp', 'endTimestamp', 
-    'successDestination', 'failureDestination', 'status'
+    'vaultId', 'creator', 'amount', 'startTimestamp', 'endTimestamp',
+    'successDestination', 'failureDestination', 'status',
   ]
-  
-  // Check for unknown fields
+
   const fieldValidation = validateAllowedFields(payload as unknown as Record<string, unknown>, allowedFields)
-  if (!fieldValidation.isValid) {
-    return fieldValidation
-  }
-  
-  // Validate required fields
-  if (!payload.vaultId || typeof payload.vaultId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid vaultId field' }
-  }
-  if (!payload.creator || typeof payload.creator !== 'string') {
-    return { isValid: false, error: 'Missing or invalid creator field' }
-  }
-  
-  if (!validateStellarAddress(payload.creator)) {
-    return { isValid: false, error: 'Invalid creator address format' }
-  }
-  if (!payload.amount || typeof payload.amount !== 'string') {
-    return { isValid: false, error: 'Missing or invalid amount field' }
-  }
-  if (isNaN(parseFloat(payload.amount))) {
-    return 'Amount must be a valid decimal number'
-  }
+  if (!fieldValidation.isValid) return fieldValidation.error ?? 'Unknown field validation error'
+
+  if (!payload.vaultId || typeof payload.vaultId !== 'string') return 'Missing or invalid vaultId field'
+  if (!payload.creator || typeof payload.creator !== 'string') return 'Missing or invalid creator field'
+  if (!validateStellarAddress(payload.creator)) return 'Invalid creator address format'
+  if (!payload.amount || typeof payload.amount !== 'string') return 'Missing or invalid amount field'
+  if (isNaN(parseFloat(payload.amount))) return 'Amount must be a valid decimal number'
   if (!payload.startTimestamp || !(payload.startTimestamp instanceof Date) || isNaN(payload.startTimestamp.getTime())) {
     return 'Missing or invalid startTimestamp field'
   }
@@ -150,14 +158,11 @@ function validateVaultCreatedPayload(payload: VaultEventPayload): ValidationResu
     return 'Missing or invalid endTimestamp field'
   }
   if (!payload.successDestination || typeof payload.successDestination !== 'string') {
-    return { isValid: false, error: 'Missing or invalid successDestination field' }
+    return 'Missing or invalid successDestination field'
   }
-  
-  if (!validateStellarAddress(payload.successDestination)) {
-    return { isValid: false, error: 'Invalid successDestination address format' }
-  }
+  if (!validateStellarAddress(payload.successDestination)) return 'Invalid successDestination address format'
   if (!payload.failureDestination || typeof payload.failureDestination !== 'string') {
-    return { isValid: false, error: 'Missing or invalid failureDestination field' }
+    return 'Missing or invalid failureDestination field'
   }
   return null
 }
@@ -165,18 +170,13 @@ function validateVaultCreatedPayload(payload: VaultEventPayload): ValidationResu
 /**
  * Validates vault status event payload
  */
-function validateVaultStatusPayload(payload: VaultEventPayload): ValidationResult {
+function validateVaultStatusPayload(payload: VaultEventPayload): string | null {
   const allowedFields = ['vaultId', 'status']
-  
-  // Check for unknown fields
+
   const fieldValidation = validateAllowedFields(payload as unknown as Record<string, unknown>, allowedFields)
-  if (!fieldValidation.isValid) {
-    return fieldValidation
-  }
-  
-  if (!payload.vaultId || typeof payload.vaultId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid vaultId field' }
-  }
+  if (!fieldValidation.isValid) return fieldValidation.error ?? 'Unknown field validation error'
+
+  if (!payload.vaultId || typeof payload.vaultId !== 'string') return 'Missing or invalid vaultId field'
   const validStatuses = ['active', 'completed', 'failed', 'cancelled']
   if (!payload.status || !validStatuses.includes(payload.status)) {
     return `Invalid status value: ${payload.status}. Must be one of: ${validStatuses.join(', ')}`
@@ -236,42 +236,20 @@ function parseVaultPayload(
 /**
  * Validates milestone_created event payload
  */
-function validateMilestonePayload(payload: MilestoneEventPayload): ValidationResult {
+function validateMilestonePayload(payload: MilestoneEventPayload): string | null {
   const allowedFields = ['milestoneId', 'vaultId', 'title', 'description', 'targetAmount', 'deadline']
-  
-  // Check for unknown fields
+
   const fieldValidation = validateAllowedFields(payload as unknown as Record<string, unknown>, allowedFields)
-  if (!fieldValidation.isValid) {
-    return fieldValidation
-  }
-  
-  if (!payload.milestoneId || typeof payload.milestoneId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid milestoneId field' }
-  }
-  if (!payload.vaultId || typeof payload.vaultId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid vaultId field' }
-  }
-  if (!payload.title || typeof payload.title !== 'string') {
-    return { isValid: false, error: 'Missing or invalid title field' }
-  }
-  
-  if (payload.title.length > 255) {
-    return { isValid: false, error: 'Title must be 255 characters or less' }
-  }
-  
-  if (payload.description !== undefined && typeof payload.description !== 'string') {
-    return { isValid: false, error: 'Description must be a string' }
-  }
-  
-  if (payload.description && payload.description.length > 1000) {
-    return { isValid: false, error: 'Description must be 1000 characters or less' }
-  }
-  if (!payload.targetAmount || typeof payload.targetAmount !== 'string') {
-    return { isValid: false, error: 'Missing or invalid targetAmount field' }
-  }
-  if (isNaN(parseFloat(payload.targetAmount))) {
-    return 'targetAmount must be a valid decimal number'
-  }
+  if (!fieldValidation.isValid) return fieldValidation.error ?? 'Unknown field validation error'
+
+  if (!payload.milestoneId || typeof payload.milestoneId !== 'string') return 'Missing or invalid milestoneId field'
+  if (!payload.vaultId || typeof payload.vaultId !== 'string') return 'Missing or invalid vaultId field'
+  if (!payload.title || typeof payload.title !== 'string') return 'Missing or invalid title field'
+  if (payload.title.length > 255) return 'Title must be 255 characters or less'
+  if (payload.description !== undefined && typeof payload.description !== 'string') return 'Description must be a string'
+  if (payload.description && payload.description.length > 1000) return 'Description must be 1000 characters or less'
+  if (!payload.targetAmount || typeof payload.targetAmount !== 'string') return 'Missing or invalid targetAmount field'
+  if (isNaN(parseFloat(payload.targetAmount))) return 'targetAmount must be a valid decimal number'
   if (!payload.deadline || !(payload.deadline instanceof Date) || isNaN(payload.deadline.getTime())) {
     return 'Missing or invalid deadline field'
   }
@@ -313,31 +291,17 @@ function parseMilestonePayload(xdrData: string): MilestoneEventPayload | null {
 /**
  * Validates milestone_validated event payload
  */
-function validateValidationPayload(payload: ValidationEventPayload): ValidationResult {
+function validateValidationPayload(payload: ValidationEventPayload): string | null {
   const allowedFields = ['validationId', 'milestoneId', 'validatorAddress', 'validationResult', 'evidenceHash', 'validatedAt']
-  
-  // Check for unknown fields
+
   const fieldValidation = validateAllowedFields(payload as unknown as Record<string, unknown>, allowedFields)
-  if (!fieldValidation.isValid) {
-    return fieldValidation
-  }
-  
-  if (!payload.validationId || typeof payload.validationId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid validationId field' }
-  }
-  if (!payload.milestoneId || typeof payload.milestoneId !== 'string') {
-    return { isValid: false, error: 'Missing or invalid milestoneId field' }
-  }
-  if (!payload.validatorAddress || typeof payload.validatorAddress !== 'string') {
-    return { isValid: false, error: 'Missing or invalid validatorAddress field' }
-  }
-  
-  if (!validateStellarAddress(payload.validatorAddress)) {
-    return { isValid: false, error: 'Invalid validatorAddress format' }
-  }
-  if (!payload.validationResult || typeof payload.validationResult !== 'string') {
-    return { isValid: false, error: 'Missing or invalid validationResult field' }
-  }
+  if (!fieldValidation.isValid) return fieldValidation.error ?? 'Unknown field validation error'
+
+  if (!payload.validationId || typeof payload.validationId !== 'string') return 'Missing or invalid validationId field'
+  if (!payload.milestoneId || typeof payload.milestoneId !== 'string') return 'Missing or invalid milestoneId field'
+  if (!payload.validatorAddress || typeof payload.validatorAddress !== 'string') return 'Missing or invalid validatorAddress field'
+  if (!validateStellarAddress(payload.validatorAddress)) return 'Invalid validatorAddress format'
+  if (!payload.validationResult || typeof payload.validationResult !== 'string') return 'Missing or invalid validationResult field'
   const validResults = ['approved', 'rejected', 'pending_review']
   if (!validResults.includes(payload.validationResult)) {
     return `Invalid validationResult value: ${payload.validationResult}`

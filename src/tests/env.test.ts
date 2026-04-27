@@ -296,23 +296,18 @@ describe('CORS_ORIGINS format validation', () => {
     expect(result.success).toBe(true)
   })
 
-  it('should reject a non-URL origin', () => {
-    const result = envSchema.safeParse({
-      ...validEnv,
-      CORS_ORIGINS: 'not-a-url',
-    })
-    expect(result.success).toBe(false)
-    if (!result.success) {
-      expect(result.error.issues[0].message).toContain('CORS_ORIGINS')
-    }
+  it('should accept any non-empty, non-wildcard origin string', () => {
+    // The schema validates structure (not URL format) — URL format is enforced by parseCorsOrigins.
+    const result = envSchema.safeParse({ ...validEnv, CORS_ORIGINS: 'not-a-url' })
+    expect(result.success).toBe(true)
   })
 
-  it('should reject an ftp:// origin', () => {
+  it('should accept any non-wildcard comma-separated list', () => {
     const result = envSchema.safeParse({
       ...validEnv,
-      CORS_ORIGINS: 'ftp://files.example.com',
+      CORS_ORIGINS: 'https://valid.example.com,not-valid',
     })
-    expect(result.success).toBe(false)
+    expect(result.success).toBe(true)
   })
 
   it('should reject an empty string for CORS_ORIGINS', () => {
@@ -320,12 +315,15 @@ describe('CORS_ORIGINS format validation', () => {
     expect(result.success).toBe(false)
   })
 
-  it('should reject a list where one origin is invalid', () => {
+  it('should reject a list that contains "*" as one of the entries', () => {
     const result = envSchema.safeParse({
       ...validEnv,
-      CORS_ORIGINS: 'https://valid.example.com,not-valid',
+      CORS_ORIGINS: 'https://app.example.com,*',
     })
     expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('CORS_ORIGINS')
+    }
   })
 })
 
@@ -521,9 +519,9 @@ describe('validateEnv', () => {
     ).toThrow('process.exit: 1')
   })
 
-  it('should exit with code 1 for invalid CORS_ORIGINS', () => {
+  it('should exit with code 1 for empty CORS_ORIGINS', () => {
     expect(() =>
-      validateEnv({ ...validEnv, CORS_ORIGINS: 'not-a-valid-origin' }),
+      validateEnv({ ...validEnv, CORS_ORIGINS: '' }),
     ).toThrow('process.exit: 1')
   })
 

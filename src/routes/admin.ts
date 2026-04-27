@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express'
-import { authenticate, requireAdmin } from '../middleware/auth.js'
+import { authenticate } from '../middleware/auth.js'
 import { authorize } from '../middleware/auth.middleware.js'
 import { requireAdmin } from '../middleware/rbac.js'
 import { metricsRateLimiter } from '../middleware/rateLimiter.js'
@@ -10,6 +10,8 @@ import { createAuditLog, getAuditLogById, listAuditLogs } from '../lib/audit-log
 import { cancelVaultById } from '../services/vaultStore.js'
 import { getDBHealthMetrics } from '../services/dbMetrics.js'
 import { pool } from '../db/index.js'
+import { db } from '../db/knex.js'
+import { CheckpointStore } from '../services/checkpointStore.js'
 
 export const adminRouter = Router()
 
@@ -446,3 +448,107 @@ adminRouter.get('/db/metrics', metricsRateLimiter, (req: Request, res: Response)
     res.status(500).json({ error: 'Failed to retrieve database metrics' })
   }
 })
+
+// ── Horizon Checkpoint Management (admin-only) ────────────────────────────────
+// All routes below inherit `authenticate` + `requireAdmin` from the router.
+
+/** GET /admin/horizon/checkpoints — list all stored checkpoints. */
+adminRouter.get('/horizon/checkpoints', async (_req: Request, res: Response) => {
+  try {
+    const store = new CheckpointStore(db)
+    const checkpoints = await store.getAllCheckpoints()
+    res.status(200).json({ checkpoints })
+  } catch (error) {
+    console.error('Error listing checkpoints:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/** GET /admin/horizon/checkpoints/:contractAddress — inspect one checkpoint. */
+adminRouter.get('/horizon/checkpoints/:contractAddress', async (req: Request, res: Response) => {
+  try {
+    const store = new CheckpointStore(db)
+    const checkpoint = await store.getCheckpoint(req.params.contractAddress)
+    if (!checkpoint) {
+      res.status(404).json({ error: 'Checkpoint not found for this contract address' })
+      return
+    }
+    res.status(200).json({ checkpoint })
+  } catch (error) {
+    console.error('Error fetching checkpoint:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/**
+ * POST /admin/horizon/checkpoints/:contractAddress/reset
+ * Rewind or fast-forward the checkpoint.
+ * Body: { ledger: number, pagingToken?: string }
+ */
+adminRouter.post(
+  '/horizon/checkpoints/:contractAddress/reset',
+  async (req: Request, res: Response) => {
+    const { contractAddress } = req.params
+    const ledger = Number(req.body?.ledger)
+
+    if (!Number.isInteger(ledger) || ledger < 0) {
+      res.status(400).json({ error: '`ledger` must be a non-negative integer' })
+      return
+    }
+
+    const pagingToken: string | null =
+      typeof req.body?.pagingToken === 'string' ? req.body.pagingToken : null
+
+    try {
+      const store = new CheckpointStore(db)
+      await store.resetCheckpoint(contractAddress, ledger, pagingToken)
+
+      createAuditLog({
+        actor_user_id: req.user!.userId,
+        action: 'horizon.checkpoint.reset',
+        target_type: 'horizon_checkpoint',
+        target_id: contractAddress,
+        metadata: { ledger, pagingToken },
+      })
+
+      const updated = await store.getCheckpoint(contractAddress)
+      res.status(200).json({ message: 'Checkpoint reset', checkpoint: updated })
+    } catch (error) {
+      console.error('Error resetting checkpoint:', error)
+      res.status(500).json({ error: 'Internal server error' })
+    }
+  },
+)
+
+/** DELETE /admin/horizon/checkpoints/:contractAddress — remove a checkpoint entirely. */
+adminRouter.delete(
+  '/horizon/checkpoints/:contractAddress',
+  async (req: Request, res: Response) => {
+    const { contractAddress } = req.params
+
+    try {
+      const store = new CheckpointStore(db)
+      const existing = await store.getCheckpoint(contractAddress)
+
+      if (!existing) {
+        res.status(404).json({ error: 'Checkpoint not found for this contract address' })
+        return
+      }
+
+      await store.deleteCheckpoint(contractAddress)
+
+      createAuditLog({
+        actor_user_id: req.user!.userId,
+        action: 'horizon.checkpoint.deleted',
+        target_type: 'horizon_checkpoint',
+        target_id: contractAddress,
+        metadata: { previousLedger: existing.lastLedger },
+      })
+
+      res.status(200).json({ message: 'Checkpoint deleted' })
+    } catch (error) {
+      console.error('Error deleting checkpoint:', error)
+      res.status(500).json({ error: 'Internal server error' })
+    }
+  },
+)

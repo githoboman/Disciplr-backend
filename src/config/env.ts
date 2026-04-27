@@ -54,7 +54,13 @@ export const envSchema = z
       .default("development"),
     PORT: positiveInt(3000),
     SERVICE_NAME: z.string().default("disciplr-backend"),
-    DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+    DATABASE_URL: z
+      .string()
+      .min(1, "DATABASE_URL is required")
+      .refine(
+        (url) => /^postgres(ql)?:\/\//.test(url),
+        "DATABASE_URL must be a valid PostgreSQL connection URL (postgres:// or postgresql://)",
+      ),
 
     // ── CORS ────────────────────────────────────────────
     CORS_ORIGINS: z
@@ -78,19 +84,27 @@ export const envSchema = z
       ),
 
     // ── Auth / secrets ──────────────────────────────────────────
-    JWT_SECRET: z.string().default("change-me-in-production"),
-    JWT_ACCESS_SECRET: z.string().default("fallback-access-secret"),
-    JWT_REFRESH_SECRET: z.string().default("fallback-refresh-secret"),
-    JWT_ACCESS_EXPIRES_IN: z.string().default("15m"),
-    JWT_REFRESH_EXPIRES_IN: z.string().default("7d"),
-    DOWNLOAD_SECRET: z.string().default("change-me-in-production"),
+    JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters").default("change-me-in-production"),
+    JWT_ACCESS_SECRET: z.string().min(16, "JWT_ACCESS_SECRET must be at least 16 characters").default("fallback-access-secret"),
+    JWT_REFRESH_SECRET: z.string().min(16, "JWT_REFRESH_SECRET must be at least 16 characters").default("fallback-refresh-secret"),
+    JWT_ACCESS_EXPIRES_IN: z
+      .string()
+      .regex(/^\d+[smhd]$/, "JWT_ACCESS_EXPIRES_IN must be a duration string (e.g., 15m, 1h, 7d, 30s)")
+      .default("15m"),
+    JWT_REFRESH_EXPIRES_IN: z
+      .string()
+      .regex(/^\d+[smhd]$/, "JWT_REFRESH_EXPIRES_IN must be a duration string (e.g., 15m, 1h, 7d, 30s)")
+      .default("7d"),
+    DOWNLOAD_SECRET: z.string().min(16, "DOWNLOAD_SECRET must be at least 16 characters").default("change-me-in-production"),
 
     // ── Horizon / Stellar ───────────────────────────────────────
-    HORIZON_URL: z.string().optional(),
+    HORIZON_URL: httpUrl().optional(),
     CONTRACT_ADDRESS: z.string().optional(),
     START_LEDGER: nonNegativeInt(0).optional(),
     RETRY_MAX_ATTEMPTS: nonNegativeInt(3),
     RETRY_BACKOFF_MS: nonNegativeInt(100),
+    HORIZON_SHUTDOWN_TIMEOUT_MS: positiveInt(30_000),
+    HORIZON_LAG_THRESHOLD: nonNegativeInt(10),
 
     // ── Soroban ─────────────────────────────────────────────────
     SOROBAN_CONTRACT_ID: z.string().optional(),
