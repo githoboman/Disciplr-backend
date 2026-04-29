@@ -1,6 +1,52 @@
 import { Request, Response, NextFunction } from 'express'
 import { utcNow } from '../utils/timestamps.js'
 
+const SENSITIVE_FIELDS = new Set([
+    'email',
+    'password',
+    'token',
+    'accesstoken',
+    'refreshtoken',
+    'apikey',
+    'api_key',
+    'secret',
+    'clientsecret',
+    'creator',
+    'successdestination',
+    'failuredestination',
+    'authorization',
+    'cookie',
+    'x-api-key'
+])
+
+export function shouldRedact(key: string): boolean {
+    return SENSITIVE_FIELDS.has(key.toLowerCase())
+}
+
+export function redact(value: any): any {
+    if (value === null || value === undefined) {
+        return value
+    }
+    
+    if (Array.isArray(value)) {
+        return value.map(item => redact(item))
+    }
+    
+    if (typeof value === 'object') {
+        const result: Record<string, any> = {}
+        for (const [k, v] of Object.entries(value)) {
+            if (shouldRedact(k)) {
+                result[k] = '***REDACTED***'
+            } else {
+                result[k] = redact(v)
+            }
+        }
+        return result
+    }
+    
+    return value
+}
+
 /**
  * Middleware to mask PII in logs.
  * For this demo, it masks IP addresses and potentially sensitive fields in request bodies.
@@ -14,14 +60,15 @@ export const privacyLogger = (req: Request, _res: Response, next: NextFunction) 
     const url = req.url
 
     // Simple body masking for PII fields identified in PRIVACY.md
-    const sanitizedBody = sanitizeBody(req.body)
+    const sanitizedBody = redact(req.body)
+    const sanitizedHeaders = redact(req.headers)
 
-    console.log(`[${timestamp}] [IP: ${maskedIp}] ${method} ${url} - Body: ${JSON.stringify(sanitizedBody)}`)
+    console.log(`[${timestamp}] [IP: ${maskedIp}] ${method} ${url} - Headers: ${JSON.stringify(sanitizedHeaders)} - Body: ${JSON.stringify(sanitizedBody)}`)
 
     next()
 }
 
-function maskIp(ip: string): string {
+export function maskIp(ip: string): string {
     if (ip.includes(':')) {
         // IPv6
         return ip.split(':').slice(0, 3).join(':') + ':xxxx:xxxx:xxxx:xxxx:xxxx'
@@ -32,19 +79,4 @@ function maskIp(ip: string): string {
         return `${parts[0]}.${parts[1]}.x.x`
     }
     return 'x.x.x.x'
-}
-
-function sanitizeBody(body: any): any {
-    if (!body || typeof body !== 'object') return body
-
-    const sensitiveFields = ['creator', 'successDestination', 'failureDestination']
-    const sanitized = { ...body }
-
-    for (const field of sensitiveFields) {
-        if (sanitized[field]) {
-            sanitized[field] = '***MASKED***'
-        }
-    }
-
-    return sanitized
 }
