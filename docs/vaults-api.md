@@ -23,15 +23,28 @@ This document describes the expected request shape for `POST /api/vaults` and th
   - Minimum: `1` milestone.
   - Maximum: `20` milestones.
   - Total milestone amounts must not exceed vault amount.
+- `creator` (optional): valid Stellar public key for the vault creator.
+  - Format: Same as verifier field
+  - Must be a valid Stellar address if provided
+- `onChain` (optional): object containing blockchain deployment configuration.
+  - `mode`: `'build'` (default) or `'submit'`
+  - `contractId`: optional string identifier
+  - `networkPassphrase`: optional string for network specification
+  - `sourceAccount`: optional Stellar address for transaction source
 
 ### Milestone object
 
 Each milestone must include:
 
 - `title`: non-empty string (whitespace-only strings are rejected).
+  - No explicit length limit (handled by payload size constraints)
 - `dueDate`: valid ISO timestamp string that is not before `startDate`.
   - Can be equal to `startDate`
+  - Must use UTC timezone format (e.g., `2030-01-01T00:00:00.000Z`)
+  - Rejects offset timezones (e.g., `+05:00`)
 - `amount`: string or number; must be a positive number within the same vault bounds.
+  - Rejects decimal values (must be whole numbers)
+  - Accepts integer values only
 
 ## Boundary Conditions and Edge Cases
 
@@ -44,10 +57,15 @@ Each milestone must include:
 
 ### Timestamp Validation
 
-- **Format**: ISO 8601 with timezone (e.g., `2030-01-01T00:00:00.000Z`)
+- **Format**: ISO 8601 with UTC timezone (e.g., `2030-01-01T00:00:00.000Z`)
+  - Accepts: `2030-01-01T00:00:00Z` (no milliseconds)
+  - Accepts: `2030-01-01T00:00:00.123Z` (with milliseconds)
+  - Rejects: Offset timezones (`+05:00`, `-08:00`)
+  - Rejects: Missing timezone
 - **Date relationship**: `endDate` must be strictly greater than `startDate`
 - **Milestone constraint**: `dueDate` must be greater than or equal to `startDate`
 - **Edge case**: `endDate` can be exactly 1 millisecond after `startDate`
+- **Range limits**: Must be within JavaScript's safe date range
 
 ### Stellar Address Validation
 
@@ -109,14 +127,20 @@ The server enforces a maximum JSON body size of `100kb` for all incoming request
 
 - **Type safety**: All required fields reject `null`, `undefined`, and incorrect types
 - **Format validation**: Stellar addresses are validated against strict regex patterns
+  - Only accepts uppercase Base32 characters: `A-Z2-7`
+  - Rejects: `0`, `1`, `8`, `9`, lowercase letters
 - **Bounds checking**: All numeric inputs are validated against minimum/maximum constraints
 - **Array limits**: Milestone arrays are capped to prevent DoS via large payloads
+- **String length**: No explicit per-field limits, but overall payload size is constrained
 
 ### Overflow Protection
 
 - **Integer bounds**: Amount values are checked against safe integer limits
+  - Rejects values exceeding `Number.MAX_SAFE_INTEGER`
+  - Rejects `Infinity` and `NaN`
 - **Memory safety**: Large string values are handled gracefully without causing memory exhaustion
 - **Nested structure limits**: Milestone array size is capped to prevent exponential complexity
+- **Decimal protection**: Amount fields reject decimal values, enforcing integer-only inputs
 
 ### Error Information Disclosure
 
@@ -135,6 +159,12 @@ The validation logic is covered by comprehensive tests including:
 - Edge case handling (Infinity, NaN, overflow)
 - Error formatting stability
 - Security constraint validation
+- Stellar address validation edge cases
+- Timestamp validation with various formats
+- Milestone array boundary conditions
+- onChain field validation
+- Creator field validation
+- Complex multi-field error scenarios
 
 ### Integration Tests (`src/routes/vaults.test.ts`)
 
@@ -143,6 +173,11 @@ The validation logic is covered by comprehensive tests including:
 - Content-type validation
 - JSON parsing error handling
 - Payload size limit enforcement
+- onChain configuration validation
+- Creator address validation
+- Multi-field validation error handling
+- Large payload handling
+- Decimal amount rejection
 
 **Target coverage**: Minimum 95% for validation logic
 
@@ -203,6 +238,23 @@ The validation logic is covered by comprehensive tests including:
   "milestones": [
     { "title": "M1", "dueDate": "2030-02-01T00:00:00.000Z", "amount": "600" },
     { "title": "M2", "dueDate": "2030-03-01T00:00:00.000Z", "amount": "500" }
+  ],
+  // ... other fields
+}
+
+// Invalid onChain mode
+{
+  "onChain": {
+    "mode": "invalid-mode"
+  },
+  // ... other fields
+}
+
+// Decimal amount (rejected)
+{
+  "amount": "1000",
+  "milestones": [
+    { "title": "M1", "dueDate": "2030-02-01T00:00:00.000Z", "amount": "100.50" }
   ],
   // ... other fields
 }

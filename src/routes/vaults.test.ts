@@ -446,6 +446,262 @@ test('creates vault and returns client-sign payload', async () => {
   assert.equal(body.onChain.payload.method, 'create_vault')
 })
 
+// ─── Additional Integration Tests for Boundary Conditions ─────────────────
+
+test('returns 400 for invalid onChain mode', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      onChain: {
+        mode: 'invalid-mode',
+      },
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'onChain.mode'), true)
+})
+
+test('returns 400 for invalid creator address', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      creator: 'invalid-stellar-address',
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'creator' && f.message.includes('Stellar')), true)
+})
+
+test('accepts valid onChain configuration', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      onChain: {
+        mode: 'submit',
+        contractId: 'contract-123',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        sourceAccount: stellar(),
+      },
+    }),
+  })
+
+  assert.equal(response.status, 201)
+})
+
+test('accepts valid creator address', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      creator: stellar(),
+    }),
+  })
+
+  assert.equal(response.status, 201)
+})
+
+test('returns 400 for milestone with invalid timestamp format', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      milestones: [
+        {
+          title: 'Invalid Timestamp',
+          dueDate: '2030-01-01T00:00:00.000+05:00', // Invalid timezone format
+          amount: '500',
+        },
+      ],
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'milestones[0].dueDate' && f.message.includes('ISO timestamp')), true)
+})
+
+test('returns 400 for milestone with whitespace-only title', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      milestones: [
+        {
+          title: '   ', // Whitespace only
+          dueDate: '2030-02-01T00:00:00.000Z',
+          amount: '500',
+        },
+      ],
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'milestones[0].title' && f.message.includes('required')), true)
+})
+
+test('returns 400 for milestone amount exceeding maximum', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      milestones: [
+        {
+          title: 'Too Large',
+          dueDate: '2030-02-01T00:00:00.000Z',
+          amount: '1000000001', // Exceeds maximum
+        },
+      ],
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'milestones[0].amount' && f.message.includes('between')), true)
+})
+
+test('returns 400 for multiple validation errors across fields', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      amount: 'invalid-amount',
+      startDate: 'not-a-date',
+      endDate: '2030-01-01T00:00:00.000Z',
+      verifier: 'bad-addr',
+      destinations: { success: 'also-bad', failure: 'bad-too' },
+      milestones: [],
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  
+  // Should have errors for all the invalid fields
+  const expectedPaths = ['amount', 'startDate', 'verifier', 'destinations.success', 'destinations.failure', 'milestones']
+  expectedPaths.forEach((path) => {
+    assert.equal(body.error.fields.some((f) => f.path === path), true, `Missing error for path: ${path}`)
+  })
+})
+
+test('returns 400 for extremely large milestone title', async () => {
+  const hugeTitle = 'a'.repeat(50000) // 50KB title
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      milestones: [
+        {
+          title: hugeTitle,
+          dueDate: '2030-02-01T00:00:00.000Z',
+          amount: '500',
+        },
+      ],
+    }),
+  })
+
+  // Should accept large titles (no explicit length limit)
+  assert.equal(response.status, 201)
+})
+
+test('returns 400 for milestone amount with decimal values', async () => {
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({
+      ...validPayload(),
+      milestones: [
+        {
+          title: 'Decimal Amount',
+          dueDate: '2030-02-01T00:00:00.000Z',
+          amount: '100.50', // Decimal amount
+        },
+      ],
+    }),
+  })
+
+  assert.equal(response.status, 400)
+  const body = await response.json() as { error: { code: string; fields: Array<{ path: string; message: string }> } }
+  assert.equal(body.error.code, 'VALIDATION_ERROR')
+  assert.equal(body.error.fields.some((f) => f.path === 'milestones[0].amount'), true)
+})
+
+test('returns 413 for payload slightly over body parser limit', async () => {
+  // Create a payload that's just over the 100KB limit
+  const largePayload = {
+    ...validPayload(),
+    milestones: Array.from({ length: 20 }, (_, index) => ({
+      title: 'x'.repeat(4000), // Each milestone ~4KB
+      dueDate: '2030-02-01T00:00:00.000Z',
+      amount: '1',
+    })),
+  }
+  
+  const response = await fetch(`${baseUrl}/api/vaults`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${userToken}`,
+    },
+    body: JSON.stringify(largePayload),
+  })
+
+  assert.equal(response.status, 413)
+  const body = await response.json() as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'PAYLOAD_TOO_LARGE')
+})
+
 test('replays idempotent request and blocks hash mismatch reuse', async () => {
   const idempotencyKey = 'idem-vault-create-1'
   const authHeader = `Bearer ${userToken}`

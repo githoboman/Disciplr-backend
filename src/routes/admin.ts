@@ -1,5 +1,4 @@
 import { Router, Request, Response } from 'express'
-import { authenticate } from '../middleware/auth.js'
 import { requireAdmin } from '../middleware/rbac.js'
 import { authorize } from '../middleware/auth.middleware.js'
 import { metricsRateLimiter } from '../middleware/rateLimiter.js'
@@ -54,7 +53,7 @@ const sanitizeReasonText = (reason: string): string => {
 }
 
 // Apply authentication to all admin routes
-adminRouter.use(authenticate)
+adminRouter.use(authorize)
 adminRouter.use(requireAdmin)
 
 /**
