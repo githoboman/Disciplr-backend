@@ -11,6 +11,7 @@ contracts/
 ├── README.md
 └── accountability_vault/
     ├── Cargo.toml
+    ├── Makefile
     └── src/
         ├── lib.rs                   # AccountabilityVault contract
         └── test.rs                  # unit tests (testutils)
@@ -40,8 +41,27 @@ consumed by the backend event parser.
 
 ## Build & test
 
+From the `contracts/accountability_vault` directory:
+
 ```bash
-# from the contracts/ directory
+make build
+make test
+make fmt
+make clippy
+```
+
+Available targets:
+
+| Target | Command |
+|---|---|
+| `make build` | `stellar contract build` |
+| `make test` | `cargo test` |
+| `make fmt` | `cargo fmt -- --check` |
+| `make clippy` | `cargo clippy -- -D warnings` |
+
+You can also run the commands manually from the `contracts/` directory:
+
+```bash
 stellar contract build
 cargo test
 ```

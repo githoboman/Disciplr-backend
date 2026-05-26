@@ -1,16 +1,13 @@
-default: build
-
-all: test
-
-test: build
-	cargo test
+.PHONY: build test fmt clippy
 
 build:
 	stellar contract build
-	@ls -l target/wasm32v1-none/release/*.wasm
+
+test:
+	cargo test
 
 fmt:
-	cargo fmt --all
+	cargo fmt -- --check
 
-clean:
-	cargo clean
+clippy:
+	cargo clippy -- -D warnings
