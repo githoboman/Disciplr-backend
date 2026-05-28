@@ -123,6 +123,19 @@ curl -X POST http://localhost:3000/api/jobs/enqueue \
 - `ANALYTICS_RECOMPUTE_INTERVAL_MS` (default: `300000`)
 - `MAX_JSON_BODY_SIZE` (default: `500kb`)
 
+### Soroban environment variables
+
+The backend can optionally submit vault creation transactions directly to Stellar's Soroban network. This feature is enabled dynamically at runtime when all of the following variables are correctly configured:
+
+- `SOROBAN_CONTRACT_ID`: The 56-character base32 contract ID starting with `C`.
+- `SOROBAN_NETWORK_PASSPHRASE`: The passphrase for the Stellar network (e.g. `Test SDF Network ; September 2015`).
+- `SOROBAN_SOURCE_ACCOUNT`: The public key starting with `G` for the transaction submitter account.
+- `SOROBAN_RPC_URL`: The HTTP/HTTPS endpoint for the Soroban RPC server.
+- `SOROBAN_SECRET_KEY`: The Stellar secret key starting with `S` (never printed to logs).
+
+#### Startup Validation
+These environment variables are validated at startup. If any variable is configured with an invalid format (e.g. invalid contract ID, secret key, or RPC URL), the application will abort startup to prevent runtime errors. If they are only partially configured, a clear warning is emitted and submit mode is automatically disabled.
+
 ### Example: create a vault
 - Node.js + TypeScript
 - Express

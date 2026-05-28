@@ -146,22 +146,6 @@ export const envSchema = z
         message: 'CORS_ORIGINS cannot be "*" in production environment',
       });
     }
-    // Warning for partially configured Soroban variables
-    const sorobanVars = [
-      "SOROBAN_CONTRACT_ID",
-      "SOROBAN_NETWORK_PASSPHRASE",
-      "SOROBAN_SOURCE_ACCOUNT",
-      "SOROBAN_RPC_URL",
-      "SOROBAN_SECRET_KEY",
-    ];
-    const present = sorobanVars.filter((key) => data[key as keyof typeof data] !== undefined && data[key as keyof typeof data] !== "");
-    if (present.length > 0 && present.length < sorobanVars.length) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: [],
-        message: 'Partial Soroban configuration detected; submit mode will be disabled',
-      });
-    }
   });
 
 export type Env = z.infer<typeof envSchema>;
@@ -238,6 +222,33 @@ export function validateEnv(
       }
     }
   }
+
+    // Detect partially configured Soroban environment variables.
+    const sorobanVars = [
+      "SOROBAN_CONTRACT_ID",
+      "SOROBAN_NETWORK_PASSPHRASE",
+      "SOROBAN_SOURCE_ACCOUNT",
+      "SOROBAN_RPC_URL",
+      "SOROBAN_SECRET_KEY",
+    ];
+    const present = sorobanVars.filter((key) => validated[key as keyof Env] !== undefined && validated[key as keyof Env] !== "");
+    if (present.length > 0 && present.length < sorobanVars.length) {
+      const w: EnvWarning = {
+        variable: "SOROBAN_*",
+        message: "Partial Soroban configuration detected; submit mode will be disabled",
+      };
+      warnings.push(w);
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          event: "config.partial_soroban_configuration",
+          service: "disciplr-backend",
+          variable: "SOROBAN_*",
+          message: w.message,
+          timestamp: new Date().toISOString(),
+        }),
+      );
+    }
 
   return { env: validated, warnings };
 }
