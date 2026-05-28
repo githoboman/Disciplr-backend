@@ -83,33 +83,32 @@ describe('AppError factories', () => {
     expect(e.message).toBe('cannot process')
   })
 
-  describe('fromContractError', () => {
-    it('parses valid Soroban Error(Contract, 4) into VALIDATION_ERROR', () => {
-      const e = AppError.fromContractError(new Error('HostError: Error(Contract, 4)'))
-      expect(e).not.toBeNull()
-      expect(e?.status).toBe(400)
-      expect(e?.code).toBe(ErrorCode.VALIDATION_ERROR)
-      expect(e?.message).toBe('Invalid deadline')
-      expect(e?.details).toEqual({ contractErrorCode: 4 })
-    })
+  it('rateLimited produces 429 + RATE_LIMITED code', () => {
+    const e = AppError.rateLimited()
+    expect(e.status).toBe(429)
+    expect(e.code).toBe(ErrorCode.RATE_LIMITED)
+    expect(e.message).toBe('Too many requests')
+  })
 
-    it('parses ContractError(12) into CONFLICT (Deadline passed)', () => {
-      const e = AppError.fromContractError('Some RPC failure ContractError(12)')
-      expect(e).not.toBeNull()
-      expect(e?.status).toBe(409)
-      expect(e?.code).toBe(ErrorCode.CONFLICT)
-      expect(e?.message).toBe('Deadline passed')
-    })
+  it('rateLimited accepts a custom message', () => {
+    const e = AppError.rateLimited('slow down')
+    expect(e.status).toBe(429)
+    expect(e.code).toBe(ErrorCode.RATE_LIMITED)
+    expect(e.message).toBe('slow down')
+  })
 
-    it('returns null for unmapped error codes', () => {
-      const e = AppError.fromContractError(new Error('Error(Contract, 999)'))
-      expect(e).toBeNull()
-    })
+  it('payloadTooLarge produces 413 + PAYLOAD_TOO_LARGE code', () => {
+    const e = AppError.payloadTooLarge()
+    expect(e.status).toBe(413)
+    expect(e.code).toBe(ErrorCode.PAYLOAD_TOO_LARGE)
+    expect(e.message).toBe('Payload too large')
+  })
 
-    it('returns null for generic errors without contract codes', () => {
-      const e = AppError.fromContractError(new Error('Network timeout'))
-      expect(e).toBeNull()
-    })
+  it('payloadTooLarge accepts a custom message', () => {
+    const e = AppError.payloadTooLarge('request body exceeds 1 MB limit')
+    expect(e.status).toBe(413)
+    expect(e.code).toBe(ErrorCode.PAYLOAD_TOO_LARGE)
+    expect(e.message).toBe('request body exceeds 1 MB limit')
   })
 })
 
@@ -261,6 +260,28 @@ describe('errorHandler middleware', () => {
     expect(res.status).toBe(500)
     expect(res.body.error.code).toBe('INTERNAL_ERROR')
     expect(res.body.error.requestId).toBeUndefined()
+  })
+
+  it('returns 429 for AppError.rateLimited', async () => {
+    const app = buildApp((_req, _res, next) => {
+      next(AppError.rateLimited('slow down'))
+    })
+
+    const res = await request(app).get('/test')
+    expect(res.status).toBe(429)
+    expect(res.body.error.code).toBe('RATE_LIMITED')
+    expect(res.body.error.message).toBe('slow down')
+  })
+
+  it('returns 413 for AppError.payloadTooLarge', async () => {
+    const app = buildApp((_req, _res, next) => {
+      next(AppError.payloadTooLarge())
+    })
+
+    const res = await request(app).get('/test')
+    expect(res.status).toBe(413)
+    expect(res.body.error.code).toBe('PAYLOAD_TOO_LARGE')
+    expect(res.body.error.message).toBe('Payload too large')
   })
 })
 

@@ -1,120 +1,92 @@
-# Disciplr Soroban Contracts
+# Contracts — Error Code Catalog
 
-On-chain programmable, time-locked capital vaults for accountability staking,
-the chain-side counterpart to the `disciplr-backend` API and Horizon listener.
+This document is the authoritative reference for every error code surfaced by the
+`accountability_vault` contract and mapped by the backend in
+`src/middleware/errorHandler.ts`.
 
-## Workspace layout
+Keeping this catalog in sync with both the contract and the backend mapping is a
+hard requirement: the string codes are part of the public API contract and **must
+not be renamed or renumbered**.
 
-```text
-contracts/
-├── Cargo.toml                       # workspace manifest (soroban-sdk = "23")
-├── README.md
-└── accountability_vault/
-    ├── Cargo.toml
-    └── src/
-        ├── lib.rs                   # AccountabilityVault contract
-        └── test.rs                  # unit tests (testutils)
+---
+
+## Error Response Envelope
+
+All API errors are returned as a uniform JSON envelope:
+
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable description",
+    "details": {},
+    "requestId": "req-abc-123"
+  }
+}
 ```
 
-## accountability_vault
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `code` | string | Yes | Machine-readable code — use this for programmatic branching |
+| `message` | string | Yes | Human-readable description |
+| `details` | object | No | Field-level detail; only present on `VALIDATION_ERROR` |
+| `requestId` | string | No | Echoed from `x-request-id` header for correlation |
 
-Implements the vault lifecycle that the backend models off-chain in
-`src/services/vaultTransitions.ts` and parses events for in
-`src/services/eventParser.ts`:
+---
 
-| Function | Purpose |
-|---|---|
-| `create_vault` | Create a `Draft` vault with milestones, verifier, optional oracle, and success/failure destinations. Validates amount, deadline, and that milestone amounts sum to the total. |
-| `stake` | Creator transfers the SEP-41 token into the contract; `Draft` -> `Active`. Staked amount is measured as the actual contract balance delta to handle fee-on-transfer tokens. |
-| `stake_from` | Allowance-based staking variant using SEP-41 `transfer_from`. Enables a backend/spender account to drive staking after the creator calls `token.approve(spender, amount)`. Same balance-delta safety check as `stake`. |
-| `check_in` | Designated verifier **or** the optional oracle address confirms a milestone before its `due_date`. The emitted event includes a `source` topic (`"verifier"` or `"oracle"`) for backend parser disambiguation. |
-| `extend_deadline` | Jointly extend `end_timestamp` — requires `require_auth` from both `creator` and `verifier`. Only permitted while the vault is `Active` and before the current deadline. All existing milestone `due_date` values must remain `<= new_end_timestamp`. |
-| `slash_on_miss` | After the deadline with unverified milestones, slash funds to `failure_destination`; `Active` -> `Failed`. |
-| `claim` | When all milestones are verified, release funds to `success_destination`; `Active` -> `Completed`. |
-| `withdraw` | Cancel/refund an unfunded or unstarted vault to the creator; -> `Cancelled`. |
-| `get_vault` | Read-only accessor for the current vault record. |
+## Error Code Catalog
 
-### Oracle role
+The table below maps every `ErrorCode` constant defined in
+`src/middleware/errorHandler.ts` to its HTTP status, meaning, and the
+`AppError` factory method that produces it.
 
-Pass an `oracle: Option<Address>` to `create_vault`. When set, the oracle
-address may call `check_in` in addition to the designated `verifier`. This
-enables the backend oracle job (`src/jobs/handlers.ts`) to automate milestone
-confirmation on-chain without requiring a human signer.
+| # | Code | HTTP Status | Meaning | Factory / Trigger |
+|---|------|-------------|---------|-------------------|
+| 1 | `VALIDATION_ERROR` | 400 | Request payload failed schema validation. Includes field-level `details`. | `AppError.validation(msg, details)` |
+| 2 | `BAD_REQUEST` | 400 | Malformed request syntax or invalid parameter that is not a schema violation. | `AppError.badRequest(msg, details?)` |
+| 3 | `UNAUTHORIZED` | 401 | Authentication is required or the supplied credentials are invalid. | `AppError.unauthorized(msg?)` |
+| 4 | `FORBIDDEN` | 403 | Authenticated but not authorised for the requested resource or action. | `AppError.forbidden(msg?)` |
+| 5 | `NOT_FOUND` | 404 | The requested resource does not exist. Also emitted by the `notFound` middleware for unknown routes. | `AppError.notFound(msg?)` |
+| 6 | `CONFLICT` | 409 | Resource state conflict, e.g. duplicate entry or concurrent modification. | `AppError.conflict(msg)` |
+| 7 | `PAYLOAD_TOO_LARGE` | 413 | Request body exceeds the configured size limit. Auto-converted from express body-parser `entity.too.large` errors. | `AppError.payloadTooLarge(msg?)` |
+| 8 | `UNPROCESSABLE` | 422 | Business-logic violation that cannot be resolved by the client changing the request format, e.g. deleting the last admin. | `AppError.unprocessable(msg)` |
+| 9 | `RATE_LIMITED` | 429 | The caller has exceeded the allowed request rate for this endpoint. | `AppError.rateLimited(msg?)` |
+| 10 | `INTERNAL_ERROR` | 500 | Unexpected server-side error. The response message is always the generic string `"Internal server error"` — no internals are leaked. | `AppError.internal(msg?)` |
 
-The `milestone_checked_in` event carries a `source` topic (`"verifier"` or
-`"oracle"`) so `src/services/eventParser.ts` can distinguish automated
-confirmations from manual ones.
+---
 
-### Allowance-based staking (`stake_from`)
+## Factory Method Reference
 
-`stake_from(from, spender)` pulls tokens via `transfer_from`, letting an
-authorized backend or smart-contract account drive the staking flow once the
-creator has called `token.approve(spender, amount)`. The function verifies the
-spender's allowance before attempting the transfer and sets `vault.staked` to
-the measured balance delta, consistent with the `stake` behavior.
+```typescript
+// src/middleware/errorHandler.ts
 
-### Deadline extension rules
-
-`extend_deadline(creator, verifier, new_end_timestamp)`:
-
-- Both `creator` and `verifier` must sign (dual `require_auth`).
-- The vault must be `Active`; terminal states (`Completed`, `Failed`,
-  `Cancelled`) are immutable.
-- The current ledger time must be **before** the existing `end_timestamp`
-  (no retroactive extensions).
-- `new_end_timestamp` must be strictly **greater** than the current value.
-- Every milestone `due_date` must be `<= new_end_timestamp` after the
-  extension; milestones cannot silently outlive the vault deadline.
-
-### Balance delta assertion
-
-Both `stake` and `stake_from` measure the actual token amount received by
-reading the contract's token balance before and after the transfer. If the
-received amount is less than `vault.amount` (e.g. a fee-on-transfer token
-deducted a fee), the call is rejected with `Error::AmountMismatch` and
-`vault.staked` is never written. This prevents the contract from settling
-claims or slashes against a balance it never actually held.
-
-### Error codes
-
-| Code | Name | Meaning |
-|---|---|---|
-| 1 | `AlreadyInitialized` | `create_vault` called on an already-initialized contract |
-| 2 | `NotInitialized` | Vault not yet created |
-| 3 | `InvalidAmount` | Non-positive total or milestone amount |
-| 4 | `InvalidDeadline` | Deadline in the past, milestone due_date > end_timestamp, or extension is not strictly greater |
-| 5 | `NoMilestones` | Empty milestone list |
-| 6 | `NotDraft` | `stake`/`stake_from` called on a non-Draft vault |
-| 7 | `NotActive` | Operation requires an Active vault |
-| 8 | `Unauthorized` | Caller is not the required party (creator / verifier / oracle) |
-| 9 | `AlreadyStaked` | `stake`/`stake_from` called when `staked != 0` |
-| 10 | `MilestoneIndexOutOfRange` | Milestone index >= milestones length |
-| 11 | `MilestoneAlreadyVerified` | `check_in` on an already-verified milestone |
-| 12 | `DeadlinePassed` | `check_in` after milestone `due_date`, or `extend_deadline` after vault `end_timestamp` |
-| 13 | `DeadlineNotReached` | `slash_on_miss` called before the deadline |
-| 14 | `MilestonesIncomplete` | `claim` with unverified milestones, or `slash_on_miss` when all verified |
-| 15 | `NothingToWithdraw` | `withdraw` with zero staked balance |
-| 16 | `AmountMismatch` | Milestone amounts don't sum to total, or balance delta < declared amount |
-| 17 | `InsufficientAllowance` | `stake_from` spender allowance < vault amount |
-
-The `VaultStatus` enum (`Draft`/`Active`/`Completed`/`Failed`/`Cancelled`)
-mirrors `PersistedVault.status` in `src/types/vaults.ts`. Emitted events
-(`vault_created`, `vault_staked`, `milestone_checked_in`, `deadline_extended`,
-`vault_slashed`, `vault_completed`, `vault_cancelled`, `vault_withdrawn`) align
-with the topics consumed by the backend event parser.
-
-## Build & test
-
-```bash
-# from the contracts/ directory
-stellar contract build
-cargo test
+AppError.validation(message, details?)   // → 400 VALIDATION_ERROR
+AppError.badRequest(message, details?)   // → 400 BAD_REQUEST
+AppError.unauthorized(message?)          // → 401 UNAUTHORIZED
+AppError.forbidden(message?)             // → 403 FORBIDDEN
+AppError.notFound(message?)              // → 404 NOT_FOUND
+AppError.conflict(message)               // → 409 CONFLICT
+AppError.payloadTooLarge(message?)       // → 413 PAYLOAD_TOO_LARGE
+AppError.unprocessable(message)          // → 422 UNPROCESSABLE
+AppError.rateLimited(message?)           // → 429 RATE_LIMITED
+AppError.internal(message?)              // → 500 INTERNAL_ERROR
 ```
 
-## Backend integration
+---
 
-`src/services/soroban.ts` calls `create_vault` via the Stellar SDK
-(`@stellar/stellar-sdk` v14). The Horizon listener
-(`src/services/horizonListener.ts`) and `src/services/eventParser.ts`
-ingest the events emitted by these functions to keep the off-chain vault state
-in sync.
+## Stability Guarantee
+
+The numeric index in the catalog table above is for documentation ordering only.
+The **string code values** (e.g. `"VALIDATION_ERROR"`) are the stable identifiers
+consumed by clients and must never be changed. Adding a new code is a
+backwards-compatible change; removing or renaming an existing code is a breaking
+change and requires a major API version bump.
+
+---
+
+## Cross-References
+
+- Backend implementation: [`src/middleware/errorHandler.ts`](../src/middleware/errorHandler.ts)
+- Error envelope contract: [`docs/error-contract.md`](../docs/error-contract.md)
+- Unit tests: [`src/tests/errorHandler.test.ts`](../src/tests/errorHandler.test.ts)
+- Body-size limit test: [`src/tests/bodyLimit.test.ts`](../src/tests/bodyLimit.test.ts)
