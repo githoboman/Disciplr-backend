@@ -8,7 +8,7 @@
 //! released to the `success_destination`; on a missed deadline the capital is
 //! slashed to the `failure_destination` (e.g. a charity or forfeit address).
 //!
-//! Lifecycle: create_vault -> stake | stake_from -> (check_in)* -> claim | slash_on_miss
+//! Lifecycle: create_vault -> stake | stake_from -> (check_in)* -> claim | claim_milestone | slash_on_miss
 //! Funds movement is modeled via the SEP-41 token client (`stake`, `stake_from`,
 //! `claim`, `slash_on_miss`, `withdraw`). The contract enforces the state machine,
 //! authorization, and deadline rules on-chain.
@@ -92,6 +92,8 @@ pub struct Milestone {
     pub due_date: u64,
     /// Whether enough distinct verifiers / oracle have approved this milestone.
     pub verified: bool,
+    /// Whether this milestone's funds have already been released via `claim_milestone`.
+    pub released: bool,
 }
 
 /// Full on-chain vault record.
@@ -181,6 +183,7 @@ impl AccountabilityVault {
     /// the verifier set. Pass `None` for human-only verification.
     pub fn create_vault(
         env: Env,
+        vault_id: String,
         creator: Address,
         verifier_set: VerifierSet,
         oracle: Option<Address>,
@@ -194,7 +197,8 @@ impl AccountabilityVault {
     ) -> Result<(), Error> {
         creator.require_auth();
 
-        if env.storage().instance().has(&DataKey::Vault) {
+        let key = DataKey::Vault(vault_id);
+        if env.storage().persistent().has(&key) {
             return Err(Error::AlreadyInitialized);
         }
         if verifier_set.verifiers.is_empty() {
@@ -229,6 +233,18 @@ impl AccountabilityVault {
             return Err(Error::AmountMismatch);
         }
 
+        // Ensure all milestones are initialised with released = false.
+        let mut init_milestones = Vec::new(&env);
+        for m in milestones.iter() {
+            init_milestones.push_back(Milestone {
+                title: m.title,
+                amount: m.amount,
+                due_date: m.due_date,
+                verified: m.verified,
+                released: false,
+            });
+        }
+
         let vault = Vault {
             creator: creator.clone(),
             verifiers,
@@ -245,7 +261,9 @@ impl AccountabilityVault {
             guardian,
             paused: false,
         };
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().persistent().set(&key, &vault);
+        Self::extend_ttl(&env, &key);
+
         env.events()
             .publish((String::from_str(&env, "vault_created"), creator), amount);
         Ok(())
@@ -258,9 +276,9 @@ impl AccountabilityVault {
     /// correctly account for fee-on-transfer tokens. If the received amount is
     /// less than the declared `vault.amount`, the call is rejected with
     /// `Error::AmountMismatch`.
-    pub fn stake(env: Env, from: Address) -> Result<(), Error> {
+    pub fn stake(env: Env, vault_id: String, from: Address) -> Result<(), Error> {
         from.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if vault.status != VaultStatus::Draft {
             return Err(Error::NotDraft);
@@ -283,7 +301,10 @@ impl AccountabilityVault {
 
         vault.staked = received;
         vault.status = VaultStatus::Active;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        let key = DataKey::Vault(vault_id);
+        env.storage().persistent().set(&key, &vault);
+        Self::extend_ttl(&env, &key);
+
         env.events()
             .publish((String::from_str(&env, "vault_staked"), from), vault.staked);
         Ok(())
@@ -301,9 +322,14 @@ impl AccountabilityVault {
     /// Like `stake`, the received amount is measured via balance delta to handle
     /// fee-on-transfer tokens. Returns `Error::InsufficientAllowance` when the
     /// spender's allowance from `from` is below the vault's staking amount.
-    pub fn stake_from(env: Env, from: Address, spender: Address) -> Result<(), Error> {
+    pub fn stake_from(
+        env: Env,
+        vault_id: String,
+        from: Address,
+        spender: Address,
+    ) -> Result<(), Error> {
         spender.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if vault.status != VaultStatus::Draft {
             return Err(Error::NotDraft);
@@ -334,7 +360,10 @@ impl AccountabilityVault {
 
         vault.staked = received;
         vault.status = VaultStatus::Active;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        let key = DataKey::Vault(vault_id);
+        env.storage().persistent().set(&key, &vault);
+        Self::extend_ttl(&env, &key);
+
         env.events()
             .publish((String::from_str(&env, "vault_staked"), from), vault.staked);
         Ok(())
@@ -350,7 +379,7 @@ impl AccountabilityVault {
     /// human verifier sign-offs.
     pub fn check_in(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
         caller.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
@@ -432,6 +461,7 @@ impl AccountabilityVault {
     /// - All existing milestone `due_date` values must be `<= new_end_timestamp`.
     pub fn extend_deadline(
         env: Env,
+        vault_id: String,
         creator: Address,
         new_end_timestamp: u64,
     ) -> Result<(), Error> {
@@ -464,7 +494,10 @@ impl AccountabilityVault {
 
         let old_end = vault.end_timestamp;
         vault.end_timestamp = new_end_timestamp;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        let key = DataKey::Vault(vault_id);
+        env.storage().persistent().set(&key, &vault);
+        Self::extend_ttl(&env, &key);
+
         env.events().publish(
             (String::from_str(&env, "deadline_extended"), creator),
             (old_end, new_end_timestamp),
@@ -528,7 +561,7 @@ impl AccountabilityVault {
     /// ensuring the terminal state is committed even if the transfer call panics.
     pub fn claim(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
@@ -543,6 +576,11 @@ impl AccountabilityVault {
         }
         if !Self::all_verified(&vault) {
             return Err(Error::MilestonesIncomplete);
+        }
+        // Guard: if any milestone was already claimed via claim_milestone, reject
+        // bulk claim to prevent double-release confusion.
+        if Self::any_released(&vault) {
+            return Err(Error::PartiallyReleased);
         }
 
         // CEI: capture transfer values, update and persist state, then call external token.
@@ -569,6 +607,74 @@ impl AccountabilityVault {
         Ok(())
     }
 
+    /// Releases a single verified milestone's amount to the `success_destination`.
+    ///
+    /// Callable by the creator or verifier once the milestone at `index` is
+    /// verified (via `check_in`). Tracks released milestones on the `Milestone`
+    /// struct's `released` flag to prevent double-claiming.
+    ///
+    /// When the last milestone is claimed, the vault automatically transitions
+    /// to `Completed`.
+    pub fn claim_milestone(env: Env, caller: Address, index: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let mut vault: Vault = Self::load(&env)?;
+
+        if vault.status != VaultStatus::Active {
+            return Err(Error::NotActive);
+        }
+        if caller != vault.creator && caller != vault.verifier {
+            return Err(Error::Unauthorized);
+        }
+        if index >= vault.milestones.len() {
+            return Err(Error::MilestoneIndexOutOfRange);
+        }
+
+        let mut milestone = vault.milestones.get(index).unwrap();
+        if !milestone.verified {
+            return Err(Error::MilestonesIncomplete);
+        }
+        if milestone.released {
+            return Err(Error::MilestoneAlreadyReleased);
+        }
+
+        let payout = milestone.amount;
+
+        // Mark the milestone as released and update vault.
+        milestone.released = true;
+        vault.milestones.set(index, milestone);
+        vault.staked -= payout;
+
+        let client = token::Client::new(&env, &vault.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &vault.success_destination,
+            &payout,
+        );
+
+        env.events().publish(
+            (
+                String::from_str(&env, "milestone_claimed"),
+                vault.success_destination.clone(),
+            ),
+            (index, payout),
+        );
+
+        // Transition to Completed if every milestone has now been released.
+        if Self::all_released(&vault) {
+            vault.status = VaultStatus::Completed;
+            env.events().publish(
+                (
+                    String::from_str(&env, "vault_completed"),
+                    vault.success_destination.clone(),
+                ),
+                vault.amount,
+            );
+        }
+
+        env.storage().instance().set(&DataKey::Vault, &vault);
+        Ok(())
+    }
+
     /// Cancels an unfunded (`Draft`) vault, or refunds the creator if the vault
     /// was funded but never activated against any milestone. Only the creator
     /// may withdraw; vaults with any verified check-ins cannot be unwound.
@@ -577,14 +683,17 @@ impl AccountabilityVault {
     /// the external token transfer for the active-vault refund path.
     pub fn withdraw(env: Env, creator: Address) -> Result<(), Error> {
         creator.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if creator != vault.creator {
             return Err(Error::Unauthorized);
         }
         if vault.status == VaultStatus::Draft {
             vault.status = VaultStatus::Cancelled;
-            env.storage().instance().set(&DataKey::Vault, &vault);
+            let key = DataKey::Vault(vault_id);
+            env.storage().persistent().set(&key, &vault);
+            Self::extend_ttl(&env, &key);
+
             env.events()
                 .publish((String::from_str(&env, "vault_cancelled"), creator), 0i128);
             return Ok(());
@@ -659,8 +768,8 @@ impl AccountabilityVault {
     }
 
     /// Read-only accessor returning the current vault record.
-    pub fn get_vault(env: Env) -> Result<Vault, Error> {
-        Self::load(&env)
+    pub fn get_vault(env: Env, vault_id: String) -> Result<Vault, Error> {
+        Self::load(&env, &vault_id)
     }
 
     /// Sweeps any residual token balance held by the contract to the vault creator
@@ -686,11 +795,23 @@ impl AccountabilityVault {
 
     // ── internal helpers ────────────────────────────────────────────────
 
-    fn load(env: &Env) -> Result<Vault, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Vault)
-            .ok_or(Error::NotInitialized)
+    fn load(env: &Env, vault_id: &String) -> Result<Vault, Error> {
+        let key = DataKey::Vault(vault_id.clone());
+        let vault = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NotInitialized)?;
+        Self::extend_ttl(env, &key);
+        Ok(vault)
+    }
+
+    fn extend_ttl(env: &Env, key: &DataKey) {
+        // Persistent storage TTL bumping: 30 days threshold, 30 days bump.
+        // Approx 17280 ledgers per day.
+        let threshold = 30 * 17280;
+        let bump = 30 * 17280;
+        env.storage().persistent().extend_ttl(key, threshold, bump);
     }
 
     fn all_verified(vault: &Vault) -> bool {

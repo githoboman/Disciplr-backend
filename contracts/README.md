@@ -9,6 +9,7 @@ The `accountability_vault` contract implements time-locked capital vaults on Ste
 ### Overview
 
 The accountability vault allows users to:
+- Host multiple independent vaults on a single contract deployment, keyed by a unique `vault_id`
 - Lock funds in a vault with a total amount
 - Define milestones with individual amounts that must sum to the total
 - Specify a set of verifiers (M-of-N threshold) authorized to validate milestone completion

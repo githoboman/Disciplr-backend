@@ -351,3 +351,33 @@ Quick start:
 npm run migrate:latest
 npm run migrate:status
 ```
+
+## Rate Limit Tiers
+
+The API uses per-IP and per-org rate limiting. Different limits apply based on organization tier.
+
+### Configuration
+
+Set these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ORG_RATE_LIMIT_MAX` | 200 | Max requests per minute per organization |
+| `ORG_RATE_LIMIT_WINDOW_MS` | 60000 | Time window in milliseconds for org limits |
+| `SECURITY_RATE_LIMIT_MAX_REQUESTS` | 120 | Max requests per minute per IP |
+
+### How it works
+
+1. **Per-IP limit** - Prevents a single IP from flooding the API
+2. **Per-org limit** - Prevents one organization from consuming all resources
+3. **Combined key** - Rate limit key = `org:ORG_ID:IP_ADDRESS`
+
+### Rate limit response
+
+When exceeded, returns HTTP 429 with:
+
+```json
+{
+  "error": "Too many requests, please try again later.",
+  "retryAfter": 60
+}
