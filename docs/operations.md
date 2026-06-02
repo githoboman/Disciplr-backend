@@ -47,45 +47,7 @@ Database connection closed
 | `JOB_WORKER_CONCURRENCY` | 2 | Number of concurrent job workers. |
 | `JOB_QUEUE_POLL_INTERVAL_MS` | 250 | How often the job queue checks for new work. |
 | `JOB_HISTORY_LIMIT` | 50 | Number of completed/failed jobs to keep in memory metrics. |
-| `SCHEDULER_DEGRADED_THRESHOLD_MS` | 180000 (3 mins) | Maximum time since last scheduler run before marking status degraded. |
-| `SCHEDULER_DOWN_THRESHOLD_MS` | 600000 (10 mins) | Maximum time since last scheduler run before marking status down/error. |
-
-## Expiration Scheduler Heartbeat
-
-To prevent silent failures of the in-process expiration scheduler (e.g. if the timer event loop crashes or hangs), a heartbeat is written to the PostgreSQL database on every run.
-
-### Heartbeat Mechanism
-On each execution of the expiration scheduler check (`runCheck`), the scheduler performs an upsert into the `scheduler_heartbeats` table:
-```sql
-INSERT INTO scheduler_heartbeats (name, last_run_at)
-VALUES ('expiration_scheduler', NOW())
-ON CONFLICT (name)
-DO UPDATE SET last_run_at = EXCLUDED.last_run_at;
-```
-
-### Missed-Run Alerting via Deep Health Check
-The `/api/health/deep` endpoint queries the `scheduler_heartbeats` table and surfaces the health status of the scheduler in the response details:
-
-- **`status`**:
-  - `up`: The scheduler heartbeat is fresh and has run within `SCHEDULER_DEGRADED_THRESHOLD_MS`.
-  - `stale`: The scheduler heartbeat is older than `SCHEDULER_DEGRADED_THRESHOLD_MS` but fresher than `SCHEDULER_DOWN_THRESHOLD_MS`. The deep health status is marked `degraded`.
-  - `down`: The scheduler heartbeat is older than `SCHEDULER_DOWN_THRESHOLD_MS` or no heartbeat exists. The overall deep health status is marked `error` and returns a `503 Service Unavailable` status code.
-
-### Deep Health Check Detail Example
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-06-02T10:13:44.000Z",
-  "uptime": 123.45,
-  "details": {
-    "expirationScheduler": {
-      "status": "up",
-      "lastRunAt": "2026-06-02T10:13:00.000Z",
-      "timeSinceLastRunMs": 44000
-    }
-  }
-}
-```
+| `SHUTDOWN_DRAIN_MS` | 30000 | Milliseconds to wait for in-flight HTTP requests during shutdown drain. |
 
 ## Soroban Testnet Account Funding (Friendbot Precheck)
 
