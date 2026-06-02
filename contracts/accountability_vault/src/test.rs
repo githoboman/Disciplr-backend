@@ -4,8 +4,8 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, vec, Address, Env, String,
+    testutils::{Address as _, Events, Ledger},
+    token, vec, Address, Env, String, Symbol,
 };
 
 fn create_token(env: &Env, admin: &Address) -> (Address, token::StellarAssetClient<'static>) {
@@ -1307,4 +1307,244 @@ fn test_gas_benchmarks_slash_on_miss_10_milestones() {
 
     assert!(slash_cpu < 900_000);
     assert!(slash_mem < 250_000);
+}
+
+// ── issue #488: symbol-typed event topics ────────────────────────────────────
+
+/// Extracts the first XDR-decoded topic from an emitted event tuple.
+/// Soroban testutils return events as `(contract_id, topics_vec, data)`.
+/// The topics vector is a `Vec<Val>` — we pull index 0 and try to read it as Symbol.
+fn first_topic_as_symbol(env: &Env, event_index: usize) -> Option<Symbol> {
+    use soroban_sdk::IntoVal;
+    let events = env.events().all();
+    let (_, topics, _) = events.get(event_index as u32)?;
+    let raw: soroban_sdk::Val = topics.get(0)?;
+    Symbol::try_from_val(env, &raw).ok()
+}
+
+#[test]
+fn test_vault_created_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    // create_vault is called inside setup; it is the first (and only so far) event.
+    let events = s.env.events().all();
+    assert!(!events.is_empty(), "expected at least one event");
+    let (_, topics, _) = events.get(0).unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let expected = Symbol::new(&s.env, "vault_created");
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_vault_staked_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    // Events: [vault_created(0), vault_staked(1)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 2, "expected at least vault_created + vault_staked");
+    let (_, topics, _) = events.get(1).unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_staked"));
+}
+
+#[test]
+fn test_milestone_checked_in_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.check_in(&s.vault_id, &s.verifier, &0);
+
+    // Events: [vault_created(0), vault_staked(1), milestone_checked_in(2)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.get(2).unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "milestone_checked_in"));
+}
+
+#[test]
+fn test_milestone_checked_in_source_topic_is_symbol() {
+    // The third topic (source) must be a Symbol "verifier" or "oracle".
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.check_in(&s.vault_id, &s.verifier, &0);
+
+    let events = s.env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.get(2).unwrap();
+    // topics: [milestone_checked_in, caller, source]
+    let source_val: soroban_sdk::Val = topics.get(2).unwrap();
+    let source = Symbol::try_from_val(&s.env, &source_val).expect("source topic must be a Symbol");
+    // Verifier-driven check_in must carry source = "verifier"
+    assert_eq!(source, soroban_sdk::symbol_short!("verifier"));
+}
+
+#[test]
+fn test_oracle_check_in_source_topic_is_oracle_symbol() {
+    // We need the oracle address generated in the same env as the setup.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let creator = Address::generate(&env);
+    let verifier = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let success = Address::generate(&env);
+    let failure = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let (token, token_admin_client) = create_token(&env, &token_admin);
+    token_admin_client.mint(&creator, &500);
+
+    let contract_id = env.register_contract(None, AccountabilityVault);
+    let contract = AccountabilityVaultClient::new(&env, &contract_id);
+
+    let verifier_set = VerifierSet {
+        verifiers: vec![&env, verifier.clone()],
+        threshold: 1u32,
+    };
+    let milestones = vec![
+        &env,
+        Milestone {
+            title: String::from_str(&env, "m"),
+            amount: 500,
+            due_date: 1_200,
+            verified: false,
+            released: false,
+        },
+    ];
+    let vault_id = String::from_str(&env, "v1");
+    contract.create_vault(
+        &vault_id,
+        &creator,
+        &verifier_set,
+        &Some(oracle.clone()),
+        &token,
+        &500,
+        &success,
+        &failure,
+        &1_200,
+        &milestones,
+        &guardian,
+    );
+    contract.stake(&vault_id, &creator);
+    contract.check_in(&vault_id, &oracle, &0);
+
+    // Events: [vault_created(0), vault_staked(1), milestone_checked_in(2)]
+    let events = env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.get(2).unwrap();
+    // topics: [milestone_checked_in, caller, source]
+    let source_val: soroban_sdk::Val = topics.get(2).unwrap();
+    let source = Symbol::try_from_val(&env, &source_val).expect("source topic must be a Symbol");
+    assert_eq!(source, soroban_sdk::symbol_short!("oracle"));
+}
+
+#[test]
+fn test_vault_slashed_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.env.ledger().set_timestamp(2_000);
+    s.contract.slash_on_miss(&s.vault_id);
+
+    // Events: [vault_created(0), vault_staked(1), vault_slashed(2)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.get(2).unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_slashed"));
+}
+
+#[test]
+fn test_vault_completed_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.check_in(&s.vault_id, &s.verifier, &0);
+    s.contract.claim(&s.vault_id, &s.creator);
+
+    // Events: [vault_created(0), vault_staked(1), milestone_checked_in(2), vault_completed(3)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 4);
+    let (_, topics, _) = events.last().unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_completed"));
+}
+
+#[test]
+fn test_vault_cancelled_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.withdraw(&s.vault_id, &s.creator);
+
+    // Events: [vault_created(0), vault_cancelled(1)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 2);
+    let (_, topics, _) = events.get(1).unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_cancelled"));
+}
+
+#[test]
+fn test_vault_withdrawn_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    // Advance to deadline without any check-in, then try withdraw — but since
+    // withdraw on an Active vault with no verified milestones is allowed, use that path.
+    s.contract.withdraw(&s.vault_id, &s.creator);
+
+    // Events: [vault_created(0), vault_staked(1), vault_withdrawn(2)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.last().unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_withdrawn"));
+}
+
+#[test]
+fn test_deadline_extended_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    let vault = s.contract.get_vault(&s.vault_id);
+    s.contract.extend_deadline(&s.vault_id, &s.creator, &(vault.end_timestamp + 500));
+
+    // Events: [vault_created(0), vault_staked(1), deadline_extended(2)]
+    let events = s.env.events().all();
+    assert!(events.len() >= 3);
+    let (_, topics, _) = events.last().unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "deadline_extended"));
+}
+
+#[test]
+fn test_vault_paused_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.emergency_pause(&s.vault_id, &s.guardian);
+
+    let events = s.env.events().all();
+    let (_, topics, _) = events.last().unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_paused"));
+}
+
+#[test]
+fn test_vault_unpaused_emits_symbol_topic() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.emergency_pause(&s.vault_id, &s.guardian);
+    s.contract.emergency_unpause(&s.vault_id, &s.guardian);
+
+    let events = s.env.events().all();
+    let (_, topics, _) = events.last().unwrap();
+    let topic0: soroban_sdk::Val = topics.get(0).unwrap();
+    let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
+    assert_eq!(actual, Symbol::new(&s.env, "vault_unpaused"));
 }

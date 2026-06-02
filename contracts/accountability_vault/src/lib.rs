@@ -37,7 +37,8 @@
 //!   (`"oracle"` vs `"verifier"`) is included in the emitted event for backend parsing.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    String, Symbol, Vec,
 };
 
 /// Storage keys for the contract.
@@ -265,7 +266,7 @@ impl AccountabilityVault {
         Self::extend_ttl(&env, &key);
 
         env.events()
-            .publish((String::from_str(&env, "vault_created"), creator), amount);
+            .publish((Symbol::new(&env, "vault_created"), creator), amount);
         Ok(())
     }
 
@@ -306,7 +307,7 @@ impl AccountabilityVault {
         Self::extend_ttl(&env, &key);
 
         env.events()
-            .publish((String::from_str(&env, "vault_staked"), from), vault.staked);
+            .publish((Symbol::new(&env, "vault_staked"), from), vault.staked);
         Ok(())
     }
 
@@ -365,7 +366,7 @@ impl AccountabilityVault {
         Self::extend_ttl(&env, &key);
 
         env.events()
-            .publish((String::from_str(&env, "vault_staked"), from), vault.staked);
+            .publish((Symbol::new(&env, "vault_staked"), from), vault.staked);
         Ok(())
     }
 
@@ -434,13 +435,13 @@ impl AccountabilityVault {
         }
 
         let source = if is_oracle {
-            String::from_str(&env, "oracle")
+            symbol_short!("oracle")
         } else {
-            String::from_str(&env, "verifier")
+            symbol_short!("verifier")
         };
         env.events().publish(
             (
-                String::from_str(&env, "milestone_checked_in"),
+                Symbol::new(&env, "milestone_checked_in"),
                 caller,
                 source,
             ),
@@ -499,7 +500,7 @@ impl AccountabilityVault {
         Self::extend_ttl(&env, &key);
 
         env.events().publish(
-            (String::from_str(&env, "deadline_extended"), creator),
+            (Symbol::new(&env, "deadline_extended"), creator),
             (old_end, new_end_timestamp),
         );
         Ok(())
@@ -544,7 +545,7 @@ impl AccountabilityVault {
 
         env.events().publish(
             (
-                String::from_str(&env, "vault_slashed"),
+                Symbol::new(&env, "vault_slashed"),
                 failure_destination,
             ),
             slashed,
@@ -599,7 +600,7 @@ impl AccountabilityVault {
 
         env.events().publish(
             (
-                String::from_str(&env, "vault_completed"),
+                Symbol::new(&env, "vault_completed"),
                 success_destination,
             ),
             released,
@@ -653,7 +654,7 @@ impl AccountabilityVault {
 
         env.events().publish(
             (
-                String::from_str(&env, "milestone_claimed"),
+                Symbol::new(&env, "milestone_claimed"),
                 vault.success_destination.clone(),
             ),
             (index, payout),
@@ -664,7 +665,7 @@ impl AccountabilityVault {
             vault.status = VaultStatus::Completed;
             env.events().publish(
                 (
-                    String::from_str(&env, "vault_completed"),
+                    Symbol::new(&env, "vault_completed"),
                     vault.success_destination.clone(),
                 ),
                 vault.amount,
@@ -695,7 +696,7 @@ impl AccountabilityVault {
             Self::extend_ttl(&env, &key);
 
             env.events()
-                .publish((String::from_str(&env, "vault_cancelled"), creator), 0i128);
+                .publish((Symbol::new(&env, "vault_cancelled"), creator), 0i128);
             return Ok(());
         }
 
@@ -726,7 +727,7 @@ impl AccountabilityVault {
         );
 
         env.events().publish(
-            (String::from_str(&env, "vault_withdrawn"), creator),
+            (Symbol::new(&env, "vault_withdrawn"), creator),
             refunded,
         );
         Ok(())
@@ -746,7 +747,7 @@ impl AccountabilityVault {
         vault.paused = true;
         env.storage().instance().set(&DataKey::Vault, &vault);
         env.events()
-            .publish((String::from_str(&env, "vault_paused"), guardian), true);
+            .publish((Symbol::new(&env, "vault_paused"), guardian), true);
         Ok(())
     }
 
@@ -763,7 +764,7 @@ impl AccountabilityVault {
         vault.paused = false;
         env.storage().instance().set(&DataKey::Vault, &vault);
         env.events()
-            .publish((String::from_str(&env, "vault_unpaused"), guardian), false);
+            .publish((Symbol::new(&env, "vault_unpaused"), guardian), false);
         Ok(())
     }
 

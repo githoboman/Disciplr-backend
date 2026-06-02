@@ -120,6 +120,44 @@ contract has built-in performance bounds.
 | `claim` | < 900,000 | < 250,000 |
 | `slash_on_miss` | < 900,000 | < 250,000 |
 
+### Events
+
+The contract emits `soroban_sdk::Symbol`-typed topics on every state transition.
+Symbols are cheaper than `String` on Soroban (lower CPU/memory cost) and are the
+idiomatic choice for event keys.
+
+Short topics (≤ 9 characters) use `symbol_short!`; longer topics use
+`Symbol::new`.  Both are decoded to plain UTF-8 strings by `scValToNative` in the
+Stellar SDK, so off-chain consumers see ordinary strings.
+
+| Symbol topic (on-chain)    | Emitted by                  | Decoded string value       |
+|----------------------------|-----------------------------|----------------------------|
+| `Symbol::new("vault_created")`    | `create_vault`       | `"vault_created"`          |
+| `Symbol::new("vault_staked")`     | `stake`, `stake_from`| `"vault_staked"`           |
+| `Symbol::new("milestone_checked_in")` | `check_in`       | `"milestone_checked_in"`   |
+| `symbol_short!("oracle")`         | `check_in` (source)  | `"oracle"`                 |
+| `symbol_short!("verifier")`       | `check_in` (source)  | `"verifier"`               |
+| `Symbol::new("deadline_extended")` | `extend_deadline`   | `"deadline_extended"`      |
+| `Symbol::new("vault_slashed")`    | `slash_on_miss`      | `"vault_slashed"`          |
+| `Symbol::new("vault_completed")`  | `claim`, `claim_milestone` | `"vault_completed"`  |
+| `Symbol::new("vault_cancelled")`  | `withdraw` (Draft)   | `"vault_cancelled"`        |
+| `Symbol::new("vault_withdrawn")`  | `withdraw` (Active)  | `"vault_withdrawn"`        |
+| `Symbol::new("vault_paused")`     | `emergency_pause`    | `"vault_paused"`           |
+| `Symbol::new("vault_unpaused")`   | `emergency_unpause`  | `"vault_unpaused"`         |
+| `Symbol::new("milestone_claimed")` | `claim_milestone`   | `"milestone_claimed"`      |
+
+The `eventParser.ts` service maps contract Symbol topic strings to the canonical
+`EventType` used by the backend:
+
+```
+vault_slashed   → vault_failed    (slash = failure destination settled)
+vault_withdrawn → vault_cancelled (active withdraw = cancelled state)
+```
+
+Informational topics (`vault_staked`, `milestone_checked_in`, `deadline_extended`,
+`vault_paused`, `vault_unpaused`, `milestone_claimed`) are acknowledged by the
+parser and silently skipped rather than treated as parse errors.
+
 ### Building and Testing
 
 #### Prerequisites
