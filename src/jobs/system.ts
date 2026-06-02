@@ -87,6 +87,13 @@ export class BackgroundJobSystem {
     return this.queue.replayDeadLetter(jobId)
   }
 
+  retryJob(jobId: string, force: boolean = false): QueuedJobReceipt<JobType> {
+    if (this.shuttingDown) {
+      throw new Error('Cannot retry job: system is shutting down')
+    }
+    return this.queue.retryJob(jobId, force)
+  }
+
   getMetrics(): QueueMetrics {
     return this.queue.getMetrics()
   }
