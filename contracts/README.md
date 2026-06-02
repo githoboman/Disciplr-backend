@@ -1,253 +1,127 @@
-# Disciplr Smart Contracts
+# Disciplr Soroban Contracts
 
-This directory contains Soroban smart contracts for the Disciplr platform.
+On-chain programmable, time-locked capital vaults for accountability staking,
+the chain-side counterpart to the `disciplr-backend` API and Horizon listener.
 
-## Accountability Vault
+## Workspace layout
 
-The `accountability_vault` contract implements time-locked capital vaults on Stellar with milestone-based release conditions.
-
-### Overview
-
-The accountability vault allows users to:
-- Host multiple independent vaults on a single contract deployment, keyed by a unique `vault_id`
-- Lock funds in a vault with a total amount
-- Define milestones with individual amounts that must sum to the total
-- Specify a set of verifiers (M-of-N threshold) authorized to validate milestone completion
-- Set a guardian address that can pause/unpause the vault in emergencies
-- Set success and failure destinations for fund release
-- Allow reclaiming residual (dust) token balances to the creator after settlement
-
-### Security Invariants
-
-#### Checks-Effects-Interactions (CEI) Pattern
-
-`slash_on_miss`, `claim`, and `withdraw` (active-vault path) all update and persist vault
-state — setting `status` to the terminal value and zeroing `staked` — **before** executing
-the external `token::Client::transfer` call. This ensures the vault reaches a terminal state
-even if the downstream token call panics or re-enters the contract.
-
-```rust
-// CEI: capture transfer values, update and persist state, then call external token.
-let slashed = vault.staked;
-let failure_destination = vault.failure_destination.clone();
-vault.status = VaultStatus::Failed;
-vault.staked = 0;
-env.storage().instance().set(&DataKey::Vault, &vault);   // ← state committed
-
-token::Client::new(&env, &token_addr).transfer(          // ← external call last
-    &env.current_contract_address(),
-    &failure_destination,
-    &slashed,
-);
+```text
+contracts/
+├── Cargo.toml                       # workspace manifest (soroban-sdk = "23")
+├── README.md
+└── accountability_vault/
+    ├── Cargo.toml
+    └── src/
+        ├── lib.rs                   # AccountabilityVault contract
+        └── test.rs                  # unit tests (testutils)
 ```
 
-#### Emergency Pause (Guardian Role)
+## accountability_vault
 
-A `guardian` address is set at `create_vault` time. The guardian may call:
+Implements the vault lifecycle that the backend models off-chain in
+`src/services/vaultTransitions.ts` and parses events for in
+`src/services/eventParser.ts`:
 
-- `emergency_pause(guardian)` — blocks `slash_on_miss`, `claim`, and active-vault
-  `withdraw` while a dispute or incident is investigated.
-- `emergency_unpause(guardian)` — re-enables normal operations.
+| Function | Purpose |
+|---|---|
+| `init` | Initialize the deployment admin that manages instance-level policy. Must be called once before allowlist administration. |
+| `set_admin` | Rotate the deployment admin. Only the current admin may call this. |
+| `set_allowed_token` | Add or remove a SEP-41 token contract from the instance-level allowlist used for new vaults. |
+| `is_allowed_token` | Read whether a token contract is currently allowed for new vault creation. |
+| `create_vault` | Create a `Draft` vault with milestones, verifier, token, and success/failure destinations. Validates amount, deadline, milestone sums, and that the requested token is allowlisted. |
+| `stake` | Creator transfers the SEP-41 token into the contract; `Draft` -> `Active`. |
+| `check_in` | Designated verifier confirms a milestone before its `due_date`. |
+| `slash_on_miss` | After the deadline with unverified milestones, slash funds to `failure_destination`; `Active` -> `Failed`. |
+| `claim` | When all milestones are verified, release funds to `success_destination`; `Active` -> `Completed`. |
+| `withdraw` | Cancel/refund an unfunded or unstarted vault to the creator; -> `Cancelled`. |
+| `get_vault` | Read-only accessor for the current vault record. |
 
-Only the address stored as `vault.guardian` may call these functions; any other address is
-rejected with `Error::Unauthorized`. Draft-vault cancellation via `withdraw` is not affected
-by the pause flag, as it involves no token transfer.
+### Token allowlist policy
 
-#### M-of-N Verifier Approvals
+`accountability_vault` enforces a deployment-wide token allowlist at vault
+creation time. The admin initializes the contract with `init`, then uses
+`set_allowed_token(admin, token, true)` to permit curated SEP-41 token
+contracts (for example an XLM SAC or approved USDC contract) and
+`set_allowed_token(admin, token, false)` to remove them. `create_vault` checks
+the selected token against the instance-level `AllowedToken(token)` storage
+entry and returns `Error::TokenNotAllowed` when the token is absent or has been
+removed. Removing a token only blocks future vault creation; existing vault
+records retain their configured token so already-created vaults can continue
+their lifecycle.
 
-`check_in` supports a configurable set of verifiers and an `approval_threshold` (M-of-N).
-A milestone is flipped to `verified` only once at least `approval_threshold` distinct
-addresses from the verifier set (or the optional oracle) have approved it.
+The `VaultStatus` enum (`Draft`/`Active`/`Completed`/`Failed`/`Cancelled`)
+mirrors `PersistedVault.status` in `src/types/vaults.ts`. Emitted events
+(`vault_created`, `vault_staked`, `milestone_checked_in`, `vault_slashed`,
+`vault_completed`, `vault_cancelled`, `vault_withdrawn`) align with the topics
+consumed by the backend event parser.
 
-- Double-approval by the same address returns `Error::AlreadyApproved`.
-- Approvals are tracked per-milestone in `DataKey::MilestoneApprovals(index)`.
-- The threshold must be ≥ 1 and ≤ `verifiers.len()`; otherwise `create_vault` returns
-  `Error::InvalidThreshold`.
+**Error Handling and Backend Recoverability:**
+Contract read operations (like `get_vault`) and state transitions (`stake`, `check_in`, `claim`) safely return `Error::NotInitialized` rather than panicking when a `vault_id` is unset in storage. The backend's `src/middleware/errorHandler.ts` relies on this typed error mapping (specifically to `ErrorCode.NOT_FOUND` with status code 404) to gracefully recover from pre-initialization read attempts.
 
-#### Evidence Hash Binding
-
-`check_in` accepts an `evidence_hash: BytesN<32>` parameter — a 32-byte digest (e.g.
-SHA-256) of the off-chain evidence artifact (document, IPFS CID, etc.). When the
-approval threshold is reached, the hash is persisted alongside the check-in timestamp
-under `DataKey::CheckIn(index)` as a `(u64, BytesN<32>)` tuple and emitted in the
-`milestone_checked_in` event value so that the on-chain record is cryptographically bound
-to the off-chain evidence.
-
-```rust
-// event topics: ("milestone_checked_in", caller, source)
-// event value:  (milestone_index, evidence_hash)
-env.events().publish(
-    (String::from_str(&env, "milestone_checked_in"), caller, source),
-    (milestone_index, evidence_hash),
-);
-```
-
-The backend `submitCheckIn(vaultId, milestoneId, evidenceHash)` passes the hex-encoded
-hash, which is decoded to `BytesN<32>` before calling the contract.
-
-### Arithmetic Safety
-
-The `create_vault` function validates that milestone amounts are positive and sum exactly to
-the declared `amount`, rejecting mismatches with `Error::AmountMismatch`.
-
-### Checked Milestone Access
-
-Contract code must not use `unwrap()` when reading milestones by caller-supplied indexes.
-Even when a nearby bounds check exists, use checked access such as
-`vault.milestones.get(index).ok_or(Error::MilestoneIndexOutOfRange)?` so future
-refactors continue to return typed contract errors instead of risking host-level panics.
-
-### Error Types
-
-| Code | Name | Meaning |
-|------|------|---------|
-| 1 | `AlreadyInitialized` | Vault storage already set |
-| 2 | `NotInitialized` | Vault not yet created |
-| 3 | `InvalidAmount` | Zero or negative amount |
-| 4 | `InvalidDeadline` | Deadline in the past or milestone exceeds vault end |
-| 5 | `NoMilestones` | Empty milestone list |
-| 6 | `NotDraft` | Expected Draft state |
-| 7 | `NotActive` | Expected Active state |
-| 8 | `Unauthorized` | Caller not permitted |
-| 9 | `AlreadyStaked` | Vault already funded |
-| 10 | `MilestoneIndexOutOfRange` | Index beyond milestone list |
-| 11 | `MilestoneAlreadyVerified` | Milestone already at threshold |
-| 12 | `DeadlinePassed` | Operation rejected after deadline |
-| 13 | `DeadlineNotReached` | Slash attempted before deadline |
-| 14 | `MilestonesIncomplete` | Not all milestones verified |
-| 15 | `NothingToWithdraw` | Staked balance is zero |
-| 16 | `AmountMismatch` | Received amount less than declared |
-| 17 | `InsufficientAllowance` | Spender allowance below vault amount |
-| 18 | `Paused` | Operation blocked by guardian pause |
-| 19 | `AlreadyApproved` | Address has already approved this milestone |
-| 20 | `NoVerifiers` | Empty verifier list |
-| 21 | `InvalidThreshold` | Threshold is 0 or exceeds verifier count |
-| 22 | `StakedRemaining` | Reclaim attempted while stake is non-zero |
-| 23 | `VaultDisputed` | Operation rejected because vault is in `Disputed` state |
-
-### Performance & Gas Benchmarks
-
-To ensure predictable scaling and prevent out-of-gas exploits or transaction failures, the
-contract has built-in performance bounds.
-
-#### Storage Reads & Complexity Analysis
-
-- **Milestone Iteration**: Functions like `claim` and `slash_on_miss` iterate over the
-  `milestones` vector. CPU and Memory usage scale linearly (O(N)) with the milestone count N.
-- **Flat Storage Access**: The storage layout guarantees flat (O(1)) read footprint. There
-  are no redundant storage reads or nested lookups within loops.
-- **Gas Bounded Growth**: CPU and Memory bounds are actively asserted in test suites to
-  catch regressions before deployment.
-
-#### Documented Footprint Thresholds (10 Milestones Baseline)
-
-| Function | CPU Cost Threshold (Instructions) | Memory Cost Threshold (Bytes) |
-|----------|----------------------------------|-------------------------------|
-| `create_vault` | < 600,000 | < 200,000 |
-| `stake` | < 700,000 | < 200,000 |
-| `check_in` | < 300,000 | < 100,000 |
-| `claim` | < 900,000 | < 250,000 |
-| `slash_on_miss` | < 900,000 | < 250,000 |
-
-### Events
-
-The contract emits `soroban_sdk::Symbol`-typed topics on every state transition.
-Symbols are cheaper than `String` on Soroban (lower CPU/memory cost) and are the
-idiomatic choice for event keys.
-
-Short topics (≤ 9 characters) use `symbol_short!`; longer topics use
-`Symbol::new`.  Both are decoded to plain UTF-8 strings by `scValToNative` in the
-Stellar SDK, so off-chain consumers see ordinary strings.
-
-| Symbol topic (on-chain)    | Emitted by                  | Decoded string value       |
-|----------------------------|-----------------------------|----------------------------|
-| `Symbol::new("vault_created")`    | `create_vault`       | `"vault_created"`          |
-| `Symbol::new("vault_staked")`     | `stake`, `stake_from`| `"vault_staked"`           |
-| `Symbol::new("milestone_checked_in")` | `check_in`       | `"milestone_checked_in"`   |
-| `symbol_short!("oracle")`         | `check_in` (source)  | `"oracle"`                 |
-| `symbol_short!("verifier")`       | `check_in` (source)  | `"verifier"`               |
-| `Symbol::new("deadline_extended")` | `extend_deadline`   | `"deadline_extended"`      |
-| `Symbol::new("vault_slashed")`    | `slash_on_miss`      | `"vault_slashed"`          |
-| `Symbol::new("vault_completed")`  | `claim`, `claim_milestone` | `"vault_completed"`  |
-| `Symbol::new("vault_cancelled")`  | `withdraw` (Draft)   | `"vault_cancelled"`        |
-| `Symbol::new("vault_withdrawn")`  | `withdraw` (Active)  | `"vault_withdrawn"`        |
-| `Symbol::new("vault_paused")`     | `emergency_pause`    | `"vault_paused"`           |
-| `Symbol::new("vault_unpaused")`   | `emergency_unpause`  | `"vault_unpaused"`         |
-| `Symbol::new("milestone_claimed")` | `claim_milestone`   | `"milestone_claimed"`      |
-
-The `eventParser.ts` service maps contract Symbol topic strings to the canonical
-`EventType` used by the backend:
-
-```
-vault_slashed   → vault_failed    (slash = failure destination settled)
-vault_withdrawn → vault_cancelled (active withdraw = cancelled state)
-```
-
-Informational topics (`vault_staked`, `milestone_checked_in`, `deadline_extended`,
-`vault_paused`, `vault_unpaused`, `milestone_claimed`) are acknowledged by the
-parser and silently skipped rather than treated as parse errors.
-
-### Building and Testing
-
-#### Prerequisites
-
-- Rust 1.70+ with `wasm32-unknown-unknown` target
-- Soroban CLI tools
-
-#### Build
+## Build & test
 
 ```bash
-cd contracts/accountability_vault
-cargo build --release --target wasm32-unknown-unknown
-```
-
-#### Test
-
-```bash
-cd contracts/accountability_vault
+# from the contracts/ directory
+stellar contract build
 cargo test
+
+# Check that the compiled contract stays within the allowed size budget
+# Fails if the .wasm artifact exceeds the 100KB budget (configurable via MAX_WASM_SIZE)
+bash build-size-check.sh
 ```
 
-### Migration: API change (cancel_vault vs withdraw)
+### Wasm Size Budget Configuration
 
-- The contract API now exposes `cancel_vault(vault_id, creator)` for explicitly
-  cancelling an unfunded `Draft` vault. This path emits the `vault_cancelled`
-  event and performs no token transfers.
-- The `withdraw(vault_id, creator)` function has been restricted to the funded
-  `Active` refund case (vaults that were staked but never had any verified
-  check-ins). It performs a CEI-safe refund to the `creator` and emits
-  `vault_withdrawn`.
-- Backend callers must choose the appropriate method based on the vault's
-  current `status`: use `cancel_vault` for `Draft`, and `withdraw` for
-  `Active` refunding. The `vault_cancelled` topic and payload remain
-  compatible with the existing backend event parser.
+To prevent accidental bloat in the smart contract, the `accountability_vault` includes a size budget check (`build-size-check.sh`) integrated into the CI pipeline.
+The default limit is set to **100,000 bytes** (~100KB).
 
+If you need to update this budget as the contract grows:
 
-#### Formatting
+1. Temporarily increase the budget locally by exporting the variable: `export MAX_WASM_SIZE=150000`
+2. Update the default value in `contracts/build-size-check.sh`
+3. Push the changes to update the CI limit.
 
-The workspace ships a `contracts/rustfmt.toml` config. Format all contract sources with:
+## Backend integration
 
-```bash
-cd contracts
-cargo fmt
+`src/services/soroban.ts` calls `create_vault` via the Stellar SDK
+(`@stellar/stellar-sdk` v14). The Horizon listener
+(`src/services/horizonListener.ts`) and `src/services/eventParser.ts`
+ingest the events emitted by these functions to keep the off-chain vault state
+in sync.
+
+## Deterministic vault address derivation
+
+Each vault is deployed as its own contract instance. The address is derived
+deterministically from the deployer address and a 32-byte salt, so
+`src/services/soroban.ts` can correlate the on-chain address to the off-chain
+`PersistedVault.id` **before** the deploy transaction is confirmed.
+
+### Derivation formula
+
+```
+contract_address = sha256("contract" || deployer_bytes || salt_bytes)
 ```
 
-#### Lint
+This is Soroban's built-in CREATE2-style address scheme. It can be computed
+client-side using `env.deployer().with_address(deployer, salt).deployed_address()`
+in Rust tests, or via the Stellar SDK `Contract.fromAddress` / deployer helpers
+in TypeScript.
 
-The workspace enables `clippy::all` warnings via `[workspace.lints.clippy]` in
-`contracts/Cargo.toml`. Run clippy with warnings treated as errors:
+### Salt convention (backend)
 
-```bash
-cd contracts
-cargo clippy -- -D warnings
+```
+salt = sha256(vault_id)   // 32-byte hash of the off-chain UUID string
 ```
 
-To suppress known false-positives in generated Soroban SDK code, add
-`#[allow(clippy::...)]` at the item level rather than disabling workspace-wide.
+See `src/services/soroban.ts` → `saltFromVaultId`.
 
-#### Test Coverage
+### Properties
 
-The contract maintains comprehensive test coverage including:
+| Property | Guarantee |
+|---|---|
+| Same `(deployer, salt)` | Always yields the same address |
+| Different `salt` | Different address (distinct vault UUIDs → distinct contracts) |
+| Different `deployer` | Different address (multi-tenant safe) |
 
 - Normal vault lifecycle (create, stake, check-in, claim, slash, withdraw)
 - CEI ordering invariants: terminal state committed before token transfer
