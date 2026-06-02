@@ -268,6 +268,69 @@ fn test_withdraw_draft_cancels() {
     assert_eq!(vault.status, VaultStatus::Cancelled);
 }
 
+// ── #489: get_unverified_milestone_indices accessor ───────────────────────────
+
+#[test]
+fn test_unverified_indices_all_unverified_on_stake() {
+    let s = setup(&[100, 200, 300], &[200, 300, 500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+
+    let indices = s.contract.get_unverified_milestone_indices(&s.vault_id).unwrap();
+    assert_eq!(indices.len(), 3);
+    assert_eq!(indices.get(0).unwrap(), 0u32);
+    assert_eq!(indices.get(1).unwrap(), 1u32);
+    assert_eq!(indices.get(2).unwrap(), 2u32);
+}
+
+#[test]
+fn test_unverified_indices_partial_verification() {
+    let s = setup(&[100, 200, 300], &[200, 300, 500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    // Verify milestone 1 only.
+    s.contract.check_in(&s.vault_id, &s.verifier, &1, &evidence_hash(&s.env, 2));
+
+    let indices = s.contract.get_unverified_milestone_indices(&s.vault_id).unwrap();
+    assert_eq!(indices.len(), 2);
+    assert_eq!(indices.get(0).unwrap(), 0u32);
+    assert_eq!(indices.get(1).unwrap(), 2u32);
+}
+
+#[test]
+fn test_unverified_indices_empty_when_all_verified() {
+    let s = setup(&[100, 200], &[300, 700]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.check_in(&s.vault_id, &s.verifier, &0, &evidence_hash(&s.env, 1));
+    s.contract.check_in(&s.vault_id, &s.verifier, &1, &evidence_hash(&s.env, 2));
+
+    let indices = s.contract.get_unverified_milestone_indices(&s.vault_id).unwrap();
+    assert_eq!(indices.len(), 0);
+}
+
+#[test]
+fn test_unverified_indices_not_initialized_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccountabilityVault, ());
+    let contract = AccountabilityVaultClient::new(&env, &contract_id);
+
+    let result = contract.try_get_unverified_milestone_indices(&String::from_str(&env, "missing"));
+    assert!(matches!(result, Err(Ok(Error::NotInitialized))));
+}
+
+#[test]
+fn test_unverified_indices_order_preserved() {
+    // Verify milestones 0 and 2; expect remaining [1, 3] in ascending order.
+    let s = setup(&[50, 100, 150, 200], &[100, 200, 300, 400]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.check_in(&s.vault_id, &s.verifier, &0, &evidence_hash(&s.env, 0));
+    s.contract.check_in(&s.vault_id, &s.verifier, &2, &evidence_hash(&s.env, 2));
+
+    let indices = s.contract.get_unverified_milestone_indices(&s.vault_id).unwrap();
+    assert_eq!(indices.len(), 2);
+    assert_eq!(indices.get(0).unwrap(), 1u32);
+    assert_eq!(indices.get(1).unwrap(), 3u32);
+}
+
 // ── cross-feature: stake_from then oracle check_in then claim ────────────────
 
 #[test]

@@ -757,6 +757,27 @@ impl AccountabilityVault {
         Self::load(&env, &vault_id)
     }
 
+    /// Returns indices of milestones that have not yet been verified, in order.
+    ///
+    /// Used by the backend deadline-check keeper (`src/jobs/handlers.ts`) to
+    /// identify which milestones to pass to `slash_on_miss` without reading the
+    /// full `Vault` struct and filtering client-side.
+    pub fn get_unverified_milestone_indices(
+        env: Env,
+        vault_id: String,
+    ) -> Result<Vec<u32>, Error> {
+        let vault = Self::load(&env, &vault_id)?;
+        let mut indices = Vec::new(&env);
+        let mut i: u32 = 0;
+        while i < vault.milestones.len() {
+            if !vault.milestones.get(i).unwrap().verified {
+                indices.push_back(i);
+            }
+            i += 1;
+        }
+        Ok(indices)
+    }
+
     /// Sweeps any residual token balance held by the contract to the vault creator
     /// after a terminal settlement. Only the creator may call this, and only once
     /// `staked` has been zeroed by `claim`, `slash_on_miss`, or `withdraw`.
