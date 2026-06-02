@@ -121,6 +121,15 @@ fn assert_token_admin_balance_unchanged(
     );
 }
 
+fn assert_stake_rejected_with_not_draft(s: &Setup) {
+    let result = s.contract.try_stake(&s.vault_id, &s.creator);
+    assert!(
+        matches!(result, Err(Ok(Error::NotDraft))),
+        "stake after cancellation must be rejected with Error::NotDraft, got: {:?}",
+        result,
+    );
+}
+
 // ── existing lifecycle tests ─────────────────────────────────────────────────
 
 #[test]
@@ -228,6 +237,17 @@ fn test_withdraw_draft_cancels() {
 }
 
 #[test]
+fn test_cancel_vault_then_stake_rejected_with_not_draft() {
+    let s = setup(&[100], &[500]);
+    s.contract.cancel_vault(&s.vault_id, &s.creator);
+    let vault = s.contract.get_vault(&s.vault_id);
+    assert_eq!(vault.status, VaultStatus::Cancelled);
+
+    // Terminal-state regression guard: Cancelled vault must never accept stake.
+    assert_stake_rejected_with_not_draft(&s);
+}
+
+#[test]
 fn test_withdraw_active_refunds_creator() {
     let s = setup(&[100], &[500]);
     // Fund the vault and then call withdraw without any check-ins.
@@ -239,6 +259,19 @@ fn test_withdraw_active_refunds_creator() {
 
     let token_client = token::Client::new(&s.env, &s.token);
     assert_eq!(token_client.balance(&s.creator), 500);
+}
+
+#[test]
+fn test_withdraw_cancelled_then_stake_rejected_with_not_draft() {
+    let s = setup(&[100], &[500]);
+    s.contract.stake(&s.vault_id, &s.creator);
+    s.contract.withdraw(&s.vault_id, &s.creator);
+
+    let vault = s.contract.get_vault(&s.vault_id);
+    assert_eq!(vault.status, VaultStatus::Cancelled);
+
+    // Terminal-state regression guard: once cancelled via withdraw, staking is blocked.
+    assert_stake_rejected_with_not_draft(&s);
 }
 
 #[test]
