@@ -67,3 +67,17 @@ If you need to update this budget as the contract grows:
 (`src/services/horizonListener.ts`) and `src/services/eventParser.ts`
 ingest the events emitted by these functions to keep the off-chain vault state
 in sync.
+
+## Upgrade & Dependency Pinning Policy
+
+To ensure deterministic builds and avoid silent feature or semantic changes between local development, staging environments, and CI, `soroban-sdk` is strictly pinned to an exact minor/patch version in the workspace root `contracts/Cargo.toml`:
+```toml
+[workspace.dependencies]
+soroban-sdk = "=23.0.1"
+```
+
+### Dependency Bump Guidelines:
+1. **Deliberate upgrades only**: Never use caret (`^`) or generic major-only ranges (`"23"`) for key core compiler/SDK crates like `soroban-sdk`.
+2. **Review release changelogs**: Ensure you review Soroban SDK changelogs before upgrading to check for changes in host functions, resource budgets, or gas/memory metering.
+3. **Regenerate lockfile**: When changing the pinned version, run `cargo update` inside the `contracts` directory to strictly lock dependencies and refresh `contracts/Cargo.lock`.
+
