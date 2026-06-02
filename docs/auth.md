@@ -365,3 +365,7 @@ Tests specifically validate that the following bypass attempts fail:
 ### Property-Based Testing
 
 The test suite includes property-based tests with minimum 100 iterations per property to validate universal security properties across all valid inputs, providing comprehensive coverage beyond unit tests.
+
+
+## Middleware Consolidation
+`auth.middleware.ts` and `userAuth.ts` have been consolidated into `auth.ts`. Please import `authenticate` and `authorize` strictly from `src/middleware/auth.js`. `requireUserAuth` is deprecated and will be removed in #454.
