@@ -597,6 +597,9 @@ impl AccountabilityVault {
             &released,
         );
 
+        // Emit vault_completed with both creator (for user attribution) and
+        // success_destination (for fund-flow tracking) so analytics can attribute
+        // the completion unambiguously without a separate storage lookup.
         env.events().publish(
             (
                 String::from_str(&env, "vault_completed"),
@@ -663,6 +666,9 @@ impl AccountabilityVault {
         // Transition to Completed if every milestone has now been released.
         if Self::all_released(&vault) {
             vault.status = VaultStatus::Completed;
+            // Emit vault_completed with both creator (for user attribution) and
+            // success_destination (for fund-flow tracking) so analytics can attribute
+            // the completion unambiguously without a separate storage lookup.
             env.events().publish(
                 (
                     String::from_str(&env, "vault_completed"),
