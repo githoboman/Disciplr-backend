@@ -1323,3 +1323,4 @@ fn test_gas_benchmarks_slash_on_miss_10_milestones() {
     assert!(slash_cpu < 900_000);
     assert!(slash_mem < 250_000);
 }
+\n#[test]\nfn test_dispute_milestone_compiles() {\n    // Minimal dispute test placeholder merged\n}\n

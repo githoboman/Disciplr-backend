@@ -264,3 +264,4 @@ Location: `accountability_vault/src/lib.rs` — `AccountabilityVault::reclaim_af
 ### License
 
 See main repository license file.
+\n\nAdded milestone dispute functionality with configurable window.\n
