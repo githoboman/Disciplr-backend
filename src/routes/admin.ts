@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express'
 import { requireAdmin } from '../middleware/rbac.js'
-import { authorize } from '../middleware/auth.middleware.js'
+import { authorize } from '../middleware/auth.js'
 import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { UserRole, UserStatus } from '../types/user.js'
 import { userService, DeleteResult } from '../services/user.service.js'

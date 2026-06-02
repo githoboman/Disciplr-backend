@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from 'express'
-import { authenticate } from '../middleware/auth.middleware.js'
+import { authenticate } from '../middleware/auth.js'
 import { UserRole } from '../types/user.js'
 import { VaultService } from '../services/vault.service.js'
 import { applyFilters, applySort, paginateArray } from '../utils/pagination.js'
