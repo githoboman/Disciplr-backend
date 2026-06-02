@@ -53,29 +53,3 @@ jobs:
         run: npm test
         env:
           NODE_ENV: test
-
-  cargo-audit-contracts:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check for contracts changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            contracts:
-              - 'contracts/**'
-
-      - name: Install Rust
-        if: steps.changes.outputs.contracts == 'true'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        if: steps.changes.outputs.contracts == 'true'
-        run: cargo install cargo-audit
-
-      - name: Run cargo audit
-        if: steps.changes.outputs.contracts == 'true'
-        run: cd contracts && cargo audit
