@@ -32,6 +32,7 @@ _Note: Deletion will permanently remove all vaults associated with the creator f
 
 - IP addresses in logs are masked (e.g., `192.168.x.x`).
 - Request bodies containing PII are filtered before logging in production environments.
+- Export queue DLQ records, metrics-style events, and structured logs must not store raw `userId`, `targetUserId`, Stellar addresses, emails, `creator`, `successDestination`, or `failureDestination`; those values are replaced with deterministic SHA-256 tokens before storage or emission.
 
 ### Retention
 

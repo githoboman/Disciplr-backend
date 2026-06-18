@@ -28,6 +28,11 @@ All logs include correlation IDs (from `x-correlation-id` or `x-request-id` head
 
 ## Redaction Policy
 
+### Export Queue DLQ and Metrics Events
+Export job failure records and export queue structured events pass through the shared privacy sanitizer before they are persisted or emitted.
+The sanitizer replaces `userId`, `targetUserId`, Stellar account addresses, emails, `creator`, `successDestination`, and `failureDestination` with deterministic 8-character SHA-256 tokens.
+This keeps failed-job diagnostics and metrics correlation stable without exposing raw user identifiers to DLQ storage, logs, or downstream observability tooling.
+
 ### Automatic Redaction Paths
 The following paths are automatically redacted by Pino (value replaced with `***REDACTED***`):
 
@@ -251,6 +256,7 @@ Debugging should rely on non-sensitive identifiers:
 Run privacy logger tests to verify redaction coverage:
 ```bash
 npm test -- src/tests/privacy-logger.test.ts
+npm test -- src/tests/exportQueue.pii.test.ts
 ```
 
 Coverage includes:
