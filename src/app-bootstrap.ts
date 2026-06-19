@@ -22,6 +22,7 @@ import { adminVerifiersRouter } from './routes/adminVerifiers.js'
 import { verificationsRouter } from './routes/verifications.js'
 import { apiKeysRouter } from './routes/apiKeys.js'
 import { notificationsRouter } from './routes/notifications.js'
+import { createNotificationService, NotificationService } from './services/notifications/factory.js'
 import { withRequestPrisma } from './middleware/withRequestPrisma.js'
 import {
   securityMetricsMiddleware,

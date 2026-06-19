@@ -403,3 +403,8 @@ export function validateEnv(raw?: Record<string, string | undefined>): {
 
   return { env: result.data, warnings };
 }
+
+/** Returns parsed JWT keys from the environment. */
+export function getJwtKeys(env: Env): JwtKey[] {
+  return (env as any).JWT_KEYS as JwtKey[];
+}

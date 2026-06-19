@@ -49,5 +49,32 @@ export function _resetEnvForTesting(): void {
   // Given the current structure, I will add a reset function to env.ts
 }
 
-// NOTE: The 'config' object export below should be removed once all 
-// usages are migrated to getEnv().X
+export type AppConfig = {
+  env: string
+  port: number
+  serviceName: string
+  corsOrigins: string[] | '*'
+  maxJsonBodySize: string
+}
+
+const _env = process.env.NODE_ENV ?? 'development'
+
+export const config: AppConfig = {
+  get env() { return _env },
+  get port() { 
+    try { return getEnv().PORT } catch { return process.env.PORT ? Number(process.env.PORT) : 3000 }
+  },
+  get serviceName() {
+    try { return getEnv().SERVICE_NAME } catch { return process.env.SERVICE_NAME ?? 'disciplr-backend' }
+  },
+  get corsOrigins() {
+    try {
+      return parseCorsOrigins(getEnv().CORS_ORIGINS, this.env)
+    } catch {
+      return parseCorsOrigins(process.env.CORS_ORIGINS, this.env)
+    }
+  },
+  get maxJsonBodySize() {
+    try { return getEnv().MAX_JSON_BODY_SIZE } catch { return process.env.MAX_JSON_BODY_SIZE ?? '500kb' }
+  }
+}
