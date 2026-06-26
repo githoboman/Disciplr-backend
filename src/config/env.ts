@@ -189,6 +189,10 @@ export const envSchema = z
     HORIZON_LAG_THRESHOLD: nonNegativeInt(10),
     HORIZON_SHUTDOWN_TIMEOUT_MS: positiveInt(30_000),
 
+    // ── Webhooks ────────────────────────────────────────────
+    WEBHOOK_INBOUND_SECRET: z.string().optional(),
+    WEBHOOK_INBOUND_SKEW_MS: positiveInt(300_000),
+
     // ── Export S3 ───────────────────────────────────────────
     EXPORT_S3_BUCKET: z.string().optional(),
     EXPORT_S3_REGION: z.string().optional(),

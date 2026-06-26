@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { requireAdmin } from '../middleware/rbac.js'
 import { queryParser } from '../middleware/queryParser.js'
 import { authenticate } from '../middleware/auth.js'
+import { requireStepUp } from '../middleware/stepUp.js'
 import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { UserRole, UserStatus } from '../types/user.js'
 import { userService, DeleteResult } from '../services/user.service.js'
@@ -19,6 +20,8 @@ import {
 import { pool } from '../db/index.js'
 import { db } from '../db/knex.js'
 import { getAbuseCategoryCounts } from '../security/abuse-monitor.js'
+import { CheckpointStore } from '../services/checkpointStore.js'
+import { getLatestListenerLag } from '../services/monitor.js'
 
 export const adminRouter = Router()
 
@@ -61,15 +64,226 @@ const sanitizeReasonText = (reason: string): string => {
     .substring(0, 500) // Limit length
 }
 
+const toIsoString = (value: Date | string | null | undefined): string | null => {
+  if (!value) return null
+  return new Date(value).toISOString()
+}
+
+const parseContractAddresses = (): string[] =>
+  (process.env.CONTRACT_ADDRESS ?? '')
+    .split(',')
+    .map((address) => address.trim())
+    .filter((address) => address.length > 0)
+
+const isValidLedger = (value: unknown): value is number =>
+  Number.isInteger(value) && Number.isSafeInteger(value) && value >= 0
+
+const isValidPagingToken = (value: unknown): value is string | null | undefined =>
+  value === undefined || value === null || (typeof value === 'string' && value.trim().length > 0 && value.length <= 256)
+
+const resolveTargetContractAddress = async (
+  suppliedContractAddress: unknown,
+  checkpointStore: CheckpointStore,
+): Promise<{ contractAddress: string } | { error: string; status: number }> => {
+  if (typeof suppliedContractAddress === 'string' && suppliedContractAddress.trim().length > 0) {
+    return { contractAddress: suppliedContractAddress.trim() }
+  }
+
+  const configuredAddresses = parseContractAddresses()
+  if (configuredAddresses.length === 1) {
+    return { contractAddress: configuredAddresses[0] }
+  }
+
+  const checkpoints = await checkpointStore.getAllCheckpoints()
+  if (checkpoints.length === 1) {
+    return { contractAddress: checkpoints[0].contractAddress }
+  }
+
+  return {
+    status: 400,
+    error: 'contractAddress is required when multiple or no Horizon contracts are configured',
+  }
+}
+
 // Apply authentication to all admin routes
 adminRouter.use(authenticate)
 adminRouter.use(requireAdmin)
 
 /**
+ * GET /api/admin/horizon/listener
+ * Detailed Horizon listener status for operators.
+ */
+adminRouter.get('/horizon/listener', async (_req: Request, res: Response) => {
+  try {
+    const checkpointStore = new CheckpointStore(db)
+    const [checkpoints, state, lastFailedEvent, maxProcessedRow] = await Promise.all([
+      checkpointStore.getAllCheckpoints(),
+      db('listener_state')
+        .where({ service_name: 'horizon_listener' })
+        .select('last_processed_ledger', 'last_processed_at', 'updated_at')
+        .first(),
+      db('failed_events')
+        .select('event_id', 'error_message', 'failed_at', 'retry_count')
+        .orderBy('failed_at', 'desc')
+        .first(),
+      db('processed_events')
+        .max('ledger_number as max_ledger')
+        .first(),
+    ])
+
+    const now = Date.now()
+    const lastProcessedAt = state?.last_processed_at ? new Date(state.last_processed_at) : null
+    const lastProcessedLedger = state?.last_processed_ledger != null ? Number(state.last_processed_ledger) : null
+    const cursorLedger = checkpoints.length > 0 ? Math.min(...checkpoints.map((checkpoint) => checkpoint.lastLedger)) : null
+    const latestProcessedLedger =
+      maxProcessedRow?.max_ledger != null ? Number(maxProcessedRow.max_ledger) : null
+
+    res.status(200).json({
+      data: {
+        cursor: {
+          effectiveLedger: cursorLedger,
+          checkpoints: checkpoints.map((checkpoint) => ({
+            contractAddress: checkpoint.contractAddress,
+            lastLedger: checkpoint.lastLedger,
+            lastPagingToken: checkpoint.lastPagingToken,
+            updatedAt: checkpoint.updatedAt.toISOString(),
+            createdAt: checkpoint.createdAt.toISOString(),
+          })),
+        },
+        lastProcessedLedger,
+        latestProcessedLedger,
+        lag: getLatestListenerLag() ?? null,
+        heartbeatAgeMs: lastProcessedAt ? now - lastProcessedAt.getTime() : null,
+        lastProcessedAt: lastProcessedAt ? lastProcessedAt.toISOString() : null,
+        listenerStateUpdatedAt: toIsoString(state?.updated_at),
+        lastError: lastFailedEvent
+          ? {
+              eventId: lastFailedEvent.event_id,
+              message: lastFailedEvent.error_message,
+              retryCount: Number(lastFailedEvent.retry_count),
+              failedAt: toIsoString(lastFailedEvent.failed_at),
+            }
+          : null,
+      },
+    })
+  } catch (error) {
+    console.error('Error fetching Horizon listener status:', error)
+    res.status(500).json({ error: 'Failed to fetch Horizon listener status' })
+  }
+})
+
+/**
+ * POST /api/admin/horizon/listener/reset-cursor
+ * Safely resets the resumable cursor for a Horizon contract.
+ */
+adminRouter.post('/horizon/listener/reset-cursor', async (req: Request, res: Response) => {
+  try {
+    const { contractAddress, ledger, pagingToken, force = false, reason } = req.body ?? {}
+
+    if (!isValidLedger(ledger)) {
+      res.status(400).json({ error: 'ledger must be a non-negative safe integer' })
+      return
+    }
+
+    if (!isValidPagingToken(pagingToken)) {
+      res.status(400).json({ error: 'pagingToken must be a non-empty string up to 256 characters' })
+      return
+    }
+
+    if (typeof force !== 'boolean') {
+      res.status(400).json({ error: 'force must be a boolean when supplied' })
+      return
+    }
+
+    const checkpointStore = new CheckpointStore(db)
+    const target = await resolveTargetContractAddress(contractAddress, checkpointStore)
+    if ('error' in target) {
+      res.status(target.status).json({ error: target.error })
+      return
+    }
+
+    const [currentCheckpoint, maxProcessedRow] = await Promise.all([
+      checkpointStore.getCheckpoint(target.contractAddress),
+      db('processed_events')
+        .max('ledger_number as max_ledger')
+        .first(),
+    ])
+
+    const latestProcessedLedger =
+      maxProcessedRow?.max_ledger != null ? Number(maxProcessedRow.max_ledger) : null
+
+    if (!force && latestProcessedLedger !== null && ledger < latestProcessedLedger) {
+      res.status(409).json({
+        error: 'Refusing to move cursor behind already-processed events without force=true',
+        latestProcessedLedger,
+        requestedLedger: ledger,
+      })
+      return
+    }
+
+    const sanitizedReason = reason ? sanitizeReasonText(String(reason)) : undefined
+    const normalizedPagingToken = pagingToken === undefined ? null : pagingToken
+
+    await checkpointStore.resetCheckpoint(target.contractAddress, ledger, normalizedPagingToken)
+    const updatedCheckpoint = await checkpointStore.getCheckpoint(target.contractAddress)
+
+    const auditLog = await createAuditLog({
+      actor_user_id: req.user!.userId,
+      action: 'horizon.listener.cursor_reset',
+      target_type: 'horizon_listener',
+      target_id: target.contractAddress,
+      metadata: {
+        contract_address: target.contractAddress,
+        previous_ledger: currentCheckpoint?.lastLedger ?? null,
+        previous_paging_token: currentCheckpoint?.lastPagingToken ?? null,
+        requested_ledger: ledger,
+        requested_paging_token: normalizedPagingToken,
+        latest_processed_ledger: latestProcessedLedger,
+        force,
+        reason: sanitizedReason,
+        request_context: {
+          user_agent: req.headers['user-agent'],
+          method: req.method,
+          path: req.originalUrl,
+        },
+      },
+    })
+
+    res.status(200).json({
+      message: 'Horizon listener cursor reset',
+      checkpoint: updatedCheckpoint
+        ? {
+            contractAddress: updatedCheckpoint.contractAddress,
+            lastLedger: updatedCheckpoint.lastLedger,
+            lastPagingToken: updatedCheckpoint.lastPagingToken,
+            updatedAt: updatedCheckpoint.updatedAt.toISOString(),
+            createdAt: updatedCheckpoint.createdAt.toISOString(),
+          }
+        : null,
+      previousCheckpoint: currentCheckpoint
+        ? {
+            contractAddress: currentCheckpoint.contractAddress,
+            lastLedger: currentCheckpoint.lastLedger,
+            lastPagingToken: currentCheckpoint.lastPagingToken,
+            updatedAt: currentCheckpoint.updatedAt.toISOString(),
+            createdAt: currentCheckpoint.createdAt.toISOString(),
+          }
+        : null,
+      latestProcessedLedger,
+      forced: force,
+      auditLogId: auditLog.id,
+    })
+  } catch (error) {
+    console.error('Error resetting Horizon listener cursor:', error)
+    res.status(500).json({ error: 'Failed to reset Horizon listener cursor' })
+  }
+})
+
+/**
  * Force-logout a user (Admin only) - Preserve Issue #46 logic
  * Force-logout a user (Admin only) - Issue #46 logic preserved
  */
-adminRouter.post('/users/:userId/revoke-sessions', async (req: Request, res: Response) => {
+adminRouter.post('/users/:userId/revoke-sessions', requireStepUp(), async (req: Request, res: Response) => {
   const { userId } = req.params
   
   if (!userId) {
@@ -159,7 +373,7 @@ adminRouter.get('/audit-logs/:id', async (req, res) => {
   }
 })
 
-adminRouter.post('/overrides/vaults/:id/cancel', async (req, res) => {
+adminRouter.post('/overrides/vaults/:id/cancel', requireStepUp(), async (req, res) => {
   const { id } = req.params
   const { reason, reasonCode, idempotencyKey, details } = req.body ?? {}
 

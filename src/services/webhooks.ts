@@ -1,8 +1,24 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { isIP } from 'node:net'
+import { WebhookSubscriberRepository } from '../repositories/webhookSubscriberRepository.js'
 import { retryWithBackoff } from '../utils/retry.js'
+import { db } from '../db/index.js'
+
+export interface WebhookDeadLetter {
+  id: string
+  subscriber_id: string
+  event_id: string
+  event_type: string
+  payload: WebhookDeliveryPayload
+  last_error: string
+  attempts: number
+  failed_at: string
+  replayed_at: string | null
+}
 
 export interface WebhookSubscriber {
   id: string
+  organizationId: string
   url: string
   secret: string
   events: string[]
@@ -16,6 +32,7 @@ export interface WebhookDeliveryPayload {
   eventType: string
   timestamp: string
   data: Record<string, unknown>
+  organizationId: string
 }
 
 export interface WebhookDeliveryResult {
@@ -35,8 +52,7 @@ export const VAULT_LIFECYCLE_EVENTS = new Set([
   'vault_cancelled',
 ])
 
-// In-memory subscriber store (same pattern as apiKeys memory repository).
-const subscribers = new Map<string, WebhookSubscriber>()
+const repo = new WebhookSubscriberRepository(db)
 
 /**
  * Returns true when a URL is safe to deliver to.
@@ -62,18 +78,35 @@ export const isUrlAllowed = (
     return false
   }
 
-  const hostname = parsed.hostname
+  // Strip brackets from IPv6 addresses — Node >= 25 includes them in hostname.
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase()
+  const ipv6MappedMatch = hostname.match(/^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f:]+))$/i)
+  const normalizedIpv4 = ipv6MappedMatch
+    ? (ipv6MappedMatch[1] ?? ipv6MappedMatch[2]
+        .split(':')
+        .flatMap((part) => {
+          const value = Number.parseInt(part || '0', 16)
+          return [String((value >> 8) & 255), String(value & 255)]
+        })
+        .slice(-4)
+        .join('.'))
+    : hostname
 
   // Block loopback and common private ranges (SSRF mitigation)
   if (
     hostname === 'localhost' ||
-    hostname === '127.0.0.1' ||
+    hostname.endsWith('.localhost') ||
+    normalizedIpv4 === '127.0.0.1' ||
     hostname === '::1' ||
-    /^10\./.test(hostname) ||
-    /^192\.168\./.test(hostname) ||
-    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname) ||
-    /^169\.254\./.test(hostname)
+    /^10\./.test(normalizedIpv4) ||
+    /^192\.168\./.test(normalizedIpv4) ||
+    /^172\.(1[6-9]|2[0-9]|3[01])\./.test(normalizedIpv4) ||
+    /^169\.254\./.test(normalizedIpv4)
   ) {
+    return false
+  }
+
+  if (isIP(hostname) === 0 && /(?:^|\.)localtest\.me$/.test(hostname)) {
     return false
   }
 
@@ -104,31 +137,28 @@ export const verifySignature = (secret: string, body: string, signature: string)
   return timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(signature, 'utf8'))
 }
 
-export const addSubscriber = (url: string, secret: string, events: string[]): WebhookSubscriber => {
+export const addSubscriber = async (
+  organizationId: string,
+  url: string,
+  secret: string,
+  events: string[],
+): Promise<WebhookSubscriber> => {
   if (!isUrlAllowed(url)) {
     throw new Error(`Webhook URL not permitted: ${url}`)
   }
 
-  const subscriber: WebhookSubscriber = {
-    id: randomUUID(),
-    url,
-    secret,
-    events: [...events],
-    active: true,
-    createdAt: new Date().toISOString(),
-  }
-
-  subscribers.set(subscriber.id, subscriber)
-  return subscriber
+  return repo.create({ organizationId, url, secret, events })
 }
 
-export const removeSubscriber = (id: string): boolean => subscribers.delete(id)
+export const removeSubscriber = async (id: string): Promise<boolean> => repo.remove(id)
 
-export const listSubscribers = (): WebhookSubscriber[] =>
-  Array.from(subscribers.values()).filter((s) => s.active)
+export const listSubscribers = async (organizationId: string): Promise<WebhookSubscriber[]> =>
+  repo.findByOrg(organizationId)
 
-/** Test helper – clears all subscribers. */
-export const resetSubscribers = (): void => subscribers.clear()
+/** Test helper – clears all subscribers from the database. */
+export const resetSubscribers = async (): Promise<void> => {
+  await db('webhook_subscribers').del()
+}
 
 const deliverOnce = async (
   subscriber: WebhookSubscriber,
@@ -144,6 +174,7 @@ const deliverOnce = async (
   try {
     const response = await fetch(subscriber.url, {
       method: 'POST',
+      redirect: 'manual',
       headers: {
         'content-type': 'application/json',
         'x-disciplr-signature': signature,
@@ -154,6 +185,11 @@ const deliverOnce = async (
       body,
       signal: controller.signal,
     })
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location')
+      throw new Error(`Webhook redirect refused${location ? `: ${location}` : ''}`)
+    }
 
     if (response.status >= 400) {
       throw new Error(`HTTP ${response.status}`)
@@ -166,16 +202,15 @@ const deliverOnce = async (
 }
 
 /**
- * Dispatches a webhook event to all eligible active subscribers with
- * exponential-backoff retry (max 3 attempts).  Failures are collected
- * rather than thrown so one bad subscriber cannot block the others.
+ * Dispatches a webhook event to all eligible active subscribers for the
+ * given organization with exponential-backoff retry (max 3 attempts).
+ * Failures are collected rather than thrown so one bad subscriber cannot
+ * block the others.
  */
 export const dispatchWebhookEvent = async (
   payload: WebhookDeliveryPayload,
 ): Promise<WebhookDeliveryResult[]> => {
-  const eligible = Array.from(subscribers.values()).filter(
-    (s) => s.active && (s.events.length === 0 || s.events.includes(payload.eventType)),
-  )
+  const eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
 
   return Promise.all(
     eligible.map(async (subscriber): Promise<WebhookDeliveryResult> => {
@@ -206,15 +241,63 @@ export const dispatchWebhookEvent = async (
         }
       } catch (err: any) {
         console.error(`[Webhooks] delivery failed for subscriber ${subscriber.id}:`, err?.message)
+        const error = err?.message ?? 'Unknown error'
+        await deadLetter(subscriber.id, payload, error, attempts)
         return {
           subscriberId: subscriber.id,
           url: subscriber.url,
           statusCode: lastStatusCode,
           success: false,
-          error: err?.message ?? 'Unknown error',
+          error,
           attempts,
         }
       }
     }),
   )
+}
+
+const deadLetter = async (
+  subscriberId: string,
+  payload: WebhookDeliveryPayload,
+  lastError: string,
+  attempts: number,
+): Promise<void> => {
+  try {
+    await db('webhook_dead_letters').insert({
+      subscriber_id: subscriberId,
+      event_id: payload.eventId,
+      event_type: payload.eventType,
+      payload,
+      last_error: lastError,
+      attempts,
+    })
+  } catch (err: any) {
+    console.error(`[Webhooks] failed to persist dead letter:`, err?.message)
+  }
+}
+
+export const replayDeadLetter = async (
+  id: string,
+): Promise<{ replayed: boolean; subscriberId?: string; error?: string }> => {
+  const row = await db('webhook_dead_letters').where({ id, replayed_at: null }).first()
+  if (!row) {
+    return { replayed: false, error: 'Dead letter not found or already replayed' }
+  }
+
+  const subscriber = await repo.findById(row.subscriber_id)
+  if (!subscriber) {
+    return { replayed: false, error: 'Subscriber not registered' }
+  }
+
+  if (!isUrlAllowed(subscriber.url)) {
+    return { replayed: false, error: 'URL no longer allowed' }
+  }
+
+  try {
+    await deliverOnce(subscriber, row.payload)
+    await db('webhook_dead_letters').where({ id }).update({ replayed_at: new Date().toISOString() })
+    return { replayed: true, subscriberId: subscriber.id }
+  } catch (err: any) {
+    return { replayed: false, error: err?.message ?? 'Delivery failed' }
+  }
 }

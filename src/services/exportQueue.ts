@@ -3,12 +3,36 @@ import { Buffer } from 'node:buffer'
 import { stringify as csvStringify } from 'csv-stringify/sync'
 import type { Knex } from 'knex'
 import type { BackgroundJobSystem } from '../jobs/system.js'
-import { resolveS3Config, uploadToS3 } from './exportS3.js'
+import { Readable, Transform } from 'node:stream'
+import { createGzip, gzipSync } from 'node:zlib'
 import { maskPii, sanitizePrivacyPayload, sanitizePrivacyString } from '../utils/privacy.js'
+import { resolveS3Config, uploadToS3 } from '../services/exportS3.js'
 
-export type ExportFormat = 'csv' | 'json'
+export type ExportFormat = 'csv' | 'json' | 'ndjson'
 export type ExportScope = 'vaults' | 'transactions' | 'analytics' | 'all'
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed'
+
+export type FailureReason = 'serialization_error' | 'data_fetch_error' | 'unknown_error'
+
+export interface DlqEntry {
+  jobId: string
+  jobType: string
+  failureReason: FailureReason
+  errorMessage: string
+  attemptCount: number
+  failedAt: string
+  sanitisedContext: Record<string, unknown>
+}
+
+export interface DlqMetricsEvent {
+  event: 'entry_added' | 'entry_requeued' | 'entry_discarded' | 'dlq_cleared'
+  jobId: string
+  failureReason?: FailureReason
+  dlqDepth: number
+  timestamp: string
+}
+
+export type DlqMetricsHook = (event: DlqMetricsEvent) => void
 
 export interface ExportJob {
   id: string
@@ -169,23 +193,6 @@ const sanitizeExportTelemetry = (
   exportPiiValues(job),
 ) as Record<string, unknown>
 
-const sanitizeCsvValue = (value: unknown): string | number => {
-  if (value === null || value === undefined) {
-    return ''
-  }
-
-  if (typeof value === 'number') {
-    return value
-  }
-
-  const normalized = String(value)
-  if (/^[=+\-@\t\r]/.test(normalized)) {
-    return `'${normalized}`
-  }
-
-  return normalized
-}
-
 const toExportJob = (record: ExportJobRecord): ExportJob => ({
   id: record.id,
   userId: record.requester_user_id,
@@ -326,6 +333,49 @@ export const configureExportJobRepository = (repository: ExportJobRepository): v
   exportJobRepository = repository
 }
 
+const DEFAULT_MAX_DLQ_SIZE = 100
+
+let dlqStore: DlqEntry[] = []
+let dlqMaxSize = DEFAULT_MAX_DLQ_SIZE
+let dlqMetricsHook: DlqMetricsHook | undefined
+
+export const configureDlq = (options?: { maxSize?: number; metricsHook?: DlqMetricsHook }): void => {
+  if (options?.maxSize !== undefined) {
+    dlqMaxSize = Math.max(1, Math.floor(options.maxSize))
+  }
+  dlqMetricsHook = options?.metricsHook
+}
+
+const sanitiseDlqContext = (job: ExportJob): Record<string, unknown> => {
+  return sanitizePrivacyPayload(
+    { ...exportUserTokens(job), scope: job.scope, format: job.format, isAdmin: job.isAdmin, requestHash: job.requestHash },
+    exportPiiValues(job),
+  ) as Record<string, unknown>
+}
+
+const dlqInsert = (entry: DlqEntry): void => {
+  while (dlqStore.length >= dlqMaxSize) {
+    dlqStore.shift()
+  }
+  dlqStore.push(entry)
+}
+
+const dlqRemove = (jobId: string): DlqEntry | undefined => {
+  const index = dlqStore.findIndex(e => e.jobId === jobId)
+  if (index === -1) return undefined
+  const [entry] = dlqStore.splice(index, 1)
+  return entry
+}
+
+const safeInvokeMetricsHook = (event: DlqMetricsEvent): void => {
+  if (!dlqMetricsHook) return
+  try {
+    dlqMetricsHook(event)
+  } catch {
+    console.warn(JSON.stringify({ level: 'warn', event: 'dlq.metrics_hook_failed', timestamp: new Date().toISOString() }))
+  }
+}
+
 export function createJob(params: Omit<ExportJob, 'id' | 'status' | 'createdAt' | 'attempts'>): Promise<ExportJob> {
   return exportJobRepository.create(params)
 }
@@ -336,6 +386,76 @@ export function getJob(id: string): Promise<ExportJob | undefined> {
 
 export async function resetExportJobs(): Promise<void> {
   await exportJobRepository.reset()
+}
+
+export const getDlqEntries = (): readonly DlqEntry[] => {
+  const copy = [...dlqStore]
+  copy.reverse()
+  return copy
+}
+
+export const getDlqEntry = (jobId: string): DlqEntry | undefined =>
+  dlqStore.find(e => e.jobId === jobId)
+
+export const getDlqDepth = (): number => dlqStore.length
+
+export const requeueDlqEntry = async (jobId: string): Promise<boolean> => {
+  const entry = dlqRemove(jobId)
+  if (!entry) return false
+
+  const job = await exportJobRepository.get(jobId)
+  if (!job) return false
+
+  await exportJobRepository.update({
+    ...job,
+    status: 'pending',
+    attempts: 0,
+    error: undefined,
+    completedAt: undefined,
+  })
+
+  safeInvokeMetricsHook({
+    event: 'entry_requeued',
+    jobId,
+    dlqDepth: dlqStore.length,
+    timestamp: new Date().toISOString(),
+  })
+
+  return true
+}
+
+export const discardDlqEntry = (jobId: string): boolean => {
+  const entry = dlqRemove(jobId)
+  if (!entry) return false
+
+  safeInvokeMetricsHook({
+    event: 'entry_discarded',
+    jobId,
+    dlqDepth: dlqStore.length,
+    timestamp: new Date().toISOString(),
+  })
+
+  return true
+}
+
+export const clearDlq = (): number => {
+  const count = dlqStore.length
+  dlqStore = []
+
+  safeInvokeMetricsHook({
+    event: 'dlq_cleared',
+    jobId: '',
+    dlqDepth: 0,
+    timestamp: new Date().toISOString(),
+  })
+
+  return count
+}
+
+export const resetDlq = (): void => {
+  dlqStore = []
+  dlqMaxSize = DEFAULT_MAX_DLQ_SIZE
+  dlqMetricsHook = undefined
 }
 
 const buildExportDataFromVaultStore = (
@@ -482,10 +602,24 @@ const buildExportDataFromDatabase = async (
   return { vaults, transactions, analytics }
 }
 
+function ndjsonGzipReadable(data: ExportData): Readable {
+  const generator = async function* () {
+    for (const sectionName of EXPORT_SECTION_ORDER) {
+      const rows = data[sectionName]
+      if (!rows) continue
+      for (const row of rows) {
+        yield JSON.stringify(row) + '\n'
+      }
+    }
+  }
+  const source = Readable.from(generator())
+  return source.pipe(createGzip())
+}
+
 export function serializeExportData(
   data: ExportData,
   format: ExportFormat,
-): { buffer: Buffer; filename: string } {
+): { buffer?: Buffer; filename: string; readable?: Readable } {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
 
   if (format === 'json') {
@@ -495,33 +629,32 @@ export function serializeExportData(
     }
   }
 
-  const parts: string[] = []
+  if (format === 'ndjson') {
+    const filename = `export-${timestamp}.ndjson.gz`
+    const readable = ndjsonGzipReadable(data)
+    return { filename, readable }
+  }
+
+  const parts: string[] = [CSV_UTF8_BOM]
 
   for (const sectionName of EXPORT_SECTION_ORDER) {
     const rows = data[sectionName]
-    if (!rows) {
-      continue
-    }
-
     const schema = CSV_SCHEMAS[sectionName]
-    const orderedRows = rows.map((row) =>
-      Object.fromEntries(
-        schema.columns.map((column) => [column.key, sanitizeCsvValue(row[column.key])]),
-      ),
-    )
+    if (!rows || rows.length === 0) continue
 
     parts.push(`# ${sectionName.toUpperCase()}\n`)
     parts.push(
-      csvStringify(orderedRows, {
+      csvStringify(rows, {
         header: true,
         columns: schema.columns,
+        cast: { string: (value) => (value && /^[=+\-@\t\r]/.test(value) ? `'${value}` : value) },
       }),
     )
     parts.push('\n')
   }
 
   return {
-    buffer: Buffer.from(`${CSV_UTF8_BOM}${parts.join('')}`, 'utf8'),
+    buffer: Buffer.from(parts.join(''), 'utf8'),
     filename: `export-${timestamp}.csv`,
   }
 }
@@ -582,36 +715,43 @@ export async function processJob(
     completedAt: undefined,
   })
 
+  let _stage: 'data_fetch' | 'serialization' | undefined
   try {
     const scopedUserId = job.isAdmin ? job.targetUserId : job.userId
+    _stage = 'data_fetch'
     const data = vaultsStore
       ? buildExportDataFromVaultStore(job.scope, scopedUserId, vaultsStore)
       : await buildExportDataFromDatabase(job.scope, scopedUserId)
-    const { buffer, filename } = serializeExportData(data, job.format)
+    _stage = 'serialization'
+    const { buffer, filename, readable } = serializeExportData(data, job.format)
+    _stage = undefined
 
     const s3Config = resolveS3Config()
-    let resultBuffer: Buffer | undefined = buffer
     let s3Key: string | undefined
-
     if (s3Config) {
       const key = `exports/${job.id}/${filename}`
-      const contentType = job.format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8'
-      await uploadToS3(s3Config, key, buffer, contentType)
+      const contentType = job.format === 'csv'
+        ? 'text/csv; charset=utf-8'
+        : job.format === 'json'
+        ? 'application/json; charset=utf-8'
+        : 'application/x-ndjson'
+      if (job.format === 'ndjson' && readable) {
+        await uploadToS3(s3Config, key, readable, contentType)
+      } else if (buffer) {
+        await uploadToS3(s3Config, key, buffer, contentType)
+      }
       s3Key = key
-      resultBuffer = undefined // don't store bytes in DB when on S3
     }
-
     await exportJobRepository.update({
       ...job,
       status: 'done',
       attempts: nextAttempt,
       completedAt: new Date().toISOString(),
       error: undefined,
-      result: resultBuffer,
+      result: job.format === 'ndjson' ? undefined : buffer,
       filename,
       s3Key,
     })
-
     console.info(
       JSON.stringify(sanitizeExportTelemetry({
         level: 'info',
@@ -620,11 +760,12 @@ export async function processJob(
         format: job.format,
         scope: job.scope,
         attempt: nextAttempt,
-        bytes: buffer.length,
+        bytes: job.format === 'ndjson' ? undefined : buffer?.length,
         s3: s3Key ? true : false,
         completedAt: new Date().toISOString(),
       }, job)),
     )
+    return
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const sanitizedMessage = sanitizePrivacyString(message, exportPiiValues(job))
@@ -652,6 +793,34 @@ export async function processJob(
         error: message,
       }, job)),
     )
+
+    if (!retryable) {
+      const failureReason: FailureReason = (() => {
+        if (_stage === 'data_fetch') return 'data_fetch_error'
+        if (_stage === 'serialization') return 'serialization_error'
+        return 'unknown_error'
+      })()
+
+      const entry: DlqEntry = {
+        jobId: job.id,
+        jobType: `${job.scope}:${job.format}`,
+        failureReason,
+        errorMessage: sanitizedMessage,
+        attemptCount: nextAttempt,
+        failedAt: new Date().toISOString(),
+        sanitisedContext: sanitiseDlqContext(job),
+      }
+
+      dlqInsert(entry)
+
+      safeInvokeMetricsHook({
+        event: 'entry_added',
+        jobId: entry.jobId,
+        failureReason: entry.failureReason,
+        dlqDepth: dlqStore.length,
+        timestamp: entry.failedAt,
+      })
+    }
 
     const sanitizedError = new Error(sanitizedMessage)
     sanitizedError.name = error instanceof Error ? error.name : 'Error'
