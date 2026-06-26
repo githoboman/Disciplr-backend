@@ -55,9 +55,9 @@ export class RedisStore implements Store {
       }
     } catch (error) {
       console.warn(`[RATE_LIMIT_STORE_ERROR] Failed to increment rate limit for key ${key}:`, error)
-      // Fail-open semantics: allow the request if the store fails
+      // Fail-open semantics: allow the request if the store fails (return 1 to satisfy positive integer validation)
       return {
-        totalHits: 0,
+        totalHits: 1,
         resetTime: undefined,
       }
     }

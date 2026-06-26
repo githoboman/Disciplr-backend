@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals'
+import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals'
 import express from 'express'
 import request from 'supertest'
 import Redis from 'ioredis'
@@ -118,7 +118,7 @@ describe('Distributed Rate Limiter', () => {
     expect(res2.status).toBe(200)
 
     // Clean up
-    await badRedis.quit()
+    badRedis.disconnect()
     if (originalUrl !== undefined) {
       process.env.REDIS_URL = originalUrl
     } else {
