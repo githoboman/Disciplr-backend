@@ -154,6 +154,7 @@ Webhook subscribers are stored in the `webhook_subscribers` table:
 | `events` | `jsonb` | Array of event types to receive; empty array = wildcard (all events) |
 | `active` | `boolean` | Whether the subscriber is active |
 | `schema_version` | `integer` (default `1`) | Payload schema version (see Payload Schema Versioning) |
+| `field_policy` | `jsonb` | Field masking policy (see Field Masking & PII Stripping) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last update timestamp |
 
@@ -353,6 +354,166 @@ await addSubscriber(orgId, url, secret, events, 2)
 4. After the deprecation window expires the old version is **removed** and `addSubscriber` rejects it. Existing subscribers that still reference the removed version are downgraded to the earliest still-supported version and logged.
 5. The `LATEST_SCHEMA_VERSION` constant always points to the current stable version.
 6. The `SUPPORTED_SCHEMA_VERSIONS` set contains all versions that are neither removed nor deprecated.
+
+---
+
+## Field Masking & PII Stripping
+
+Each webhook subscriber can have a configurable **field policy** that controls which fields appear in delivered payloads and whether PII is stripped. Field masking is applied **before** the HMAC signature is computed, ensuring subscribers can verify the signature on the masked payload.
+
+### Field Policy Schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `'default' \| 'allowlist' \| 'denylist'` | `'default'` | How to filter fields |
+| `fields` | `string[]` | `[]` | Field paths to include/exclude (depending on mode) |
+| `stripPii` | `boolean` | `true` | Whether to apply PII masking |
+
+### Policy Modes
+
+| Mode | Behavior |
+|------|----------|
+| **default** | All fields are included. If `stripPii` is true, known PII fields are masked. |
+| **allowlist** | Only fields listed in `fields` are included. All other fields are omitted. |
+| **denylist** | All fields except those listed in `fields` are included. |
+
+### Field Path Syntax
+
+Field paths use dot notation for nested fields:
+- `vaultId` - Top-level field
+- `vault.name` - Nested field
+- `vault.*` - Wildcard: matches all fields under `vault`
+
+### PII Stripping
+
+When `stripPii` is `true` (the default), the following fields are automatically masked using a deterministic SHA-256 hash (first 8 hex characters):
+
+- `creator`
+- `creatoraddress`
+- `email`
+- `failuredestination`
+- `requesteruserid`
+- `successdestination`
+- `targetuserid`
+- `userid`
+
+Additionally, email addresses and Stellar account IDs found anywhere in string values are masked.
+
+### Examples
+
+#### Default Policy (PII Stripping Enabled)
+
+```json
+{
+  "mode": "default",
+  "fields": [],
+  "stripPii": true
+}
+```
+
+Input:
+```json
+{
+  "vaultId": "123",
+  "creator": "user@example.com",
+  "amount": 1000
+}
+```
+
+Output:
+```json
+{
+  "vaultId": "123",
+  "creator": "a4d8f3c2",
+  "amount": 1000
+}
+```
+
+#### Allowlist Mode
+
+```json
+{
+  "mode": "allowlist",
+  "fields": ["vaultId", "amount"],
+  "stripPii": false
+}
+```
+
+Input:
+```json
+{
+  "vaultId": "123",
+  "creator": "user@example.com",
+  "amount": 1000,
+  "secret": "sensitive"
+}
+```
+
+Output:
+```json
+{
+  "vaultId": "123",
+  "amount": 1000
+}
+```
+
+#### Denylist Mode
+
+```json
+{
+  "mode": "denylist",
+  "fields": ["internalId", "debugInfo.*"],
+  "stripPii": true
+}
+```
+
+### Admin API
+
+#### `PATCH /api/admin/webhooks/subscribers/:id/field-policy`
+
+Updates the field policy for a subscriber.
+
+**Body:**
+```json
+{
+  "organization_id": "org-123",
+  "field_policy": {
+    "mode": "allowlist",
+    "fields": ["vaultId", "status", "amount"],
+    "stripPii": true
+  }
+}
+```
+
+**Response 200:**
+```json
+{
+  "id": "uuid",
+  "field_policy": {
+    "mode": "allowlist",
+    "fields": ["vaultId", "status", "amount"],
+    "stripPii": true
+  }
+}
+```
+
+### Database Schema
+
+The `webhook_subscribers` table includes a `field_policy` JSONB column:
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| `field_policy` | `jsonb` | `{"mode": "default", "fields": [], "stripPii": true}` | Per-subscriber field masking configuration |
+
+### Signature Implications
+
+The HMAC signature is computed **after** field masking is applied. This means:
+
+1. Different subscribers may receive different payloads for the same event (based on their field policies).
+2. Each subscriber's signature is computed over their specific masked payload.
+3. Subscribers can verify the signature using the masked payload they receive.
+
+This design ensures that the signature always matches the delivered body, regardless of masking configuration.
 
 ---
 

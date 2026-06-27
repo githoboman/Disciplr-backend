@@ -3,6 +3,7 @@ import { isIP } from 'node:net'
 import { WebhookSubscriberRepository } from '../repositories/webhookSubscriberRepository.js'
 import { retryWithBackoff } from '../utils/retry.js'
 import { db } from '../db/index.js'
+import { applyFieldMasking, FieldPolicy, DEFAULT_FIELD_POLICY, parseFieldPolicy } from '../utils/webhookFieldMasking.js'
 
 export interface WebhookDeadLetter {
   id: string
@@ -37,6 +38,11 @@ export interface WebhookSubscriber {
   active: boolean
   createdAt: string
   schemaVersion: number
+  /**
+   * Per-subscriber field masking policy. Controls which fields are included
+   * in webhook payloads and whether PII is stripped. Applied before signing.
+   */
+  fieldPolicy: FieldPolicy
 }
 
 export const LATEST_SCHEMA_VERSION = 2
@@ -86,6 +92,10 @@ export interface CircuitBreakerConfig {
  * Builds the HTTP request body for a webhook delivery according to the
  * subscriber's preferred schema version.
  *
+ * Field masking is applied BEFORE serialization, so the signature is computed
+ * on the masked payload. This ensures subscribers can verify the signature
+ * even when fields are filtered or PII is stripped.
+ *
  * v1 – Original shape with schema_version appended:
  *   { eventId, eventType, timestamp, data, organizationId, schema_version: 1 }
  *
@@ -96,13 +106,17 @@ export const buildVersionedPayload = (
   subscriber: WebhookSubscriber,
   payload: WebhookDeliveryPayload,
 ): string => {
+  // Apply field masking policy to the data before serialization
+  const fieldPolicy = subscriber.fieldPolicy ?? DEFAULT_FIELD_POLICY
+  const maskedData = applyFieldMasking(payload.data, fieldPolicy)
+
   switch (subscriber.schemaVersion) {
     case 1:
       return JSON.stringify({
         eventId: payload.eventId,
         eventType: payload.eventType,
         timestamp: payload.timestamp,
-        data: payload.data,
+        data: maskedData,
         organizationId: payload.organizationId,
         schema_version: 1,
       })
@@ -110,7 +124,7 @@ export const buildVersionedPayload = (
       return JSON.stringify({
         schema_version: 2,
         event_type: payload.eventType,
-        data: payload.data,
+        data: maskedData,
       })
     default:
       throw new Error(
@@ -533,6 +547,18 @@ export const isPreviousSecretInGrace = (subscriber: WebhookSubscriber): boolean 
 
 export const listSubscribers = async (organizationId: string): Promise<WebhookSubscriber[]> =>
   repo.findByOrg(organizationId)
+
+/**
+ * Updates the field masking policy for a subscriber.
+ * Returns null when the subscriber does not exist or belongs to a different org.
+ */
+export const updateSubscriberFieldPolicy = async (
+  id: string,
+  organizationId: string,
+  fieldPolicy: FieldPolicy,
+): Promise<WebhookSubscriber | null> => {
+  return repo.updateFieldPolicy(id, organizationId, fieldPolicy)
+}
 
 /** Test helper – clears all subscribers from the database. */
 export const resetSubscribers = async (): Promise<void> => {

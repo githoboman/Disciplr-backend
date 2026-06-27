@@ -9,7 +9,9 @@ import {
   upsertSubscriber,
   rotateSubscriberSecret,
   listSubscribers,
+  updateSubscriberFieldPolicy,
 } from '../services/webhooks.js'
+import { isValidFieldPolicy, FieldPolicy } from '../utils/webhookFieldMasking.js'
 
 export const adminWebhooksRouter = Router()
 
@@ -156,6 +158,7 @@ adminWebhooksRouter.get('/subscribers', async (req: Request, res: Response) => {
         active: s.active,
         created_at: s.createdAt,
         rotated_at: s.rotatedAt,
+        field_policy: s.fieldPolicy,
       })),
     })
   } catch (error) {
@@ -214,6 +217,62 @@ adminWebhooksRouter.post(
     } catch (error) {
       console.error('Error rotating webhook subscriber secret:', error)
       res.status(500).json({ error: 'Failed to rotate secret' })
+    }
+  },
+)
+
+/**
+ * PATCH /api/admin/webhooks/subscribers/:id/field-policy
+ *
+ * Updates the field masking policy for a subscriber. The policy controls
+ * which fields are included in webhook payloads and whether PII is stripped.
+ *
+ * Body: { organization_id, field_policy: { mode, fields, stripPii } }
+ * Response 200: { id, field_policy }
+ */
+adminWebhooksRouter.patch(
+  '/subscribers/:id/field-policy',
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+      const { organization_id, field_policy } = req.body ?? {}
+
+      if (!organization_id || typeof organization_id !== 'string') {
+        res.status(400).json({ error: 'organization_id is required' })
+        return
+      }
+      if (!field_policy || !isValidFieldPolicy(field_policy)) {
+        res.status(400).json({
+          error: 'field_policy must be an object with mode ("default", "allowlist", or "denylist"), fields (string array), and stripPii (boolean)',
+        })
+        return
+      }
+
+      const updated = await updateSubscriberFieldPolicy(id, organization_id, field_policy)
+
+      if (!updated) {
+        res.status(404).json({ error: 'Subscriber not found' })
+        return
+      }
+
+      createAuditLog({
+        actor_user_id: req.user!.userId,
+        action: 'webhook.subscriber.update_field_policy',
+        target_type: 'webhook_subscriber',
+        target_id: id,
+        metadata: {
+          organizationId: organization_id,
+          fieldPolicy: field_policy,
+        },
+      })
+
+      res.status(200).json({
+        id: updated.id,
+        field_policy: updated.fieldPolicy,
+      })
+    } catch (error) {
+      console.error('Error updating webhook subscriber field policy:', error)
+      res.status(500).json({ error: 'Failed to update field policy' })
     }
   },
 )
