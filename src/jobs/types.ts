@@ -1,6 +1,7 @@
 export const JOB_TYPES = [
   'notification.send',
   'deadline.check',
+  'milestone.reminders',
   'oracle.call',
   'analytics.recompute',
   'export.generate',
@@ -19,6 +20,11 @@ export interface DeadlineCheckJobPayload {
   vaultId?: string
   deadlineIso?: string
   triggerSource: 'manual' | 'scheduler' | 'expiration-scheduler'
+}
+
+export interface MilestoneRemindersJobPayload {
+  leadTimesMs?: number[]
+  limit?: number
 }
 
 export interface OracleCallJobPayload {
@@ -44,6 +50,7 @@ export interface SessionsCleanupJobPayload {
 export interface JobPayloadByType {
   'notification.send': NotificationJobPayload
   'deadline.check': DeadlineCheckJobPayload
+  'milestone.reminders': MilestoneRemindersJobPayload
   'oracle.call': OracleCallJobPayload
   'analytics.recompute': AnalyticsRecomputeJobPayload
   'export.generate': ExportGenerateJobPayload
@@ -105,6 +112,11 @@ export const isPayloadForJobType = (
         (payload.triggerSource === 'manual' || payload.triggerSource === 'scheduler' || payload.triggerSource === 'expiration-scheduler') &&
         isOptionalString(payload.vaultId) &&
         isOptionalString(payload.deadlineIso)
+      )
+    case 'milestone.reminders':
+      return (
+        (payload.leadTimesMs === undefined || Array.isArray(payload.leadTimesMs)) &&
+        (payload.limit === undefined || typeof payload.limit === 'number')
       )
     case 'oracle.call':
       return (

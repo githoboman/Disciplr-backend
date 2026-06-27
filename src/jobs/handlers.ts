@@ -1,8 +1,9 @@
 import { NotificationService } from '../services/notifications/factory.js'
 import { processJob as processExportJob } from '../services/exportQueue.js'
 import type { JobHandler, JobType } from './types.js'
-import { markVaultExpiries } from '../services/vaultExpiry.service.js'
+import { markVaultExpiries, sendMilestoneReminders } from '../services/vaultExpiry.service.js'
 import { cleanupExpiredSessions } from '../services/session.js'
+import { buildSlashOnMissPayload } from '../services/soroban.js'
 
 type JobHandlerRegistry = {
   [K in JobType]: JobHandler<K>
@@ -41,6 +42,16 @@ export const createDefaultJobHandlers = (
         `slash_on_miss built vault=${payload.vaultId} status=${sorobanPayload.submission.status}`,
       )
     }
+  },
+  'milestone.reminders': async (payload, context) => {
+    const remindersSent = await sendMilestoneReminders({
+      leadTimesMs: payload.leadTimesMs,
+      limit: payload.limit,
+    })
+    logJob(
+      'milestone.reminders',
+      `sent ${remindersSent} reminders attempt=${context.attempt}`,
+    )
   },
   'oracle.call': async (payload, context) => {
     await sleep(60)
