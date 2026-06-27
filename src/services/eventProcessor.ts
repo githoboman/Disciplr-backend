@@ -93,20 +93,7 @@ export class EventProcessor {
         }
       })
 
-      // Fire-and-forget webhook dispatch for vault lifecycle events
-      if (VAULT_LIFECYCLE_EVENTS.has(event.eventType)) {
-        const vaultPayload = event.payload as VaultEventPayload
-        const organizationId = await resolveOrganizationId(this.db, vaultPayload)
-        dispatchWebhookEvent({
-          eventId: event.eventId,
-          eventType: event.eventType,
-          timestamp: new Date().toISOString(),
-          data: event.payload as unknown as Record<string, unknown>,
-          organizationId,
-        }).catch((err) => {
-          console.error('[EventProcessor] webhook dispatch error:', err?.message)
-        })
-      }
+
 
       return { success: true, eventId: event.eventId }
     } catch (error) {
@@ -155,6 +142,27 @@ export class EventProcessor {
 
       await this.routeEvent(event, trx)
       await this.idempotency.markEventProcessed(event, trx)
+
+      // Write to outbox table atomically for vault lifecycle events
+      if (VAULT_LIFECYCLE_EVENTS.has(event.eventType)) {
+        const vaultPayload = event.payload as VaultEventPayload
+        const organizationId = await resolveOrganizationId(trx, vaultPayload)
+        await trx('vault_outbox').insert({
+          event_id: event.eventId,
+          event_type: event.eventType,
+          payload: JSON.stringify({
+            eventId: event.eventId,
+            eventType: event.eventType,
+            timestamp: new Date().toISOString(),
+            data: event.payload,
+            organizationId,
+          }),
+          processed: false,
+          attempts: 0,
+          created_at: new Date(),
+        })
+      }
+
       await trx.commit()
     } catch (error) {
       await trx.rollback()

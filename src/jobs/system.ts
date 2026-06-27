@@ -42,6 +42,7 @@ export class BackgroundJobSystem {
     this.queue.registerHandler('analytics.recompute', handlers['analytics.recompute'])
     this.queue.registerHandler('export.generate', handlers['export.generate'])
     this.queue.registerHandler('sessions.cleanup', handlers['sessions.cleanup'])
+    this.queue.registerHandler('outbox.relay', handlers['outbox.relay'])
   }
 
   start(): void {
@@ -123,6 +124,10 @@ export class BackgroundJobSystem {
       process.env.SESSIONS_CLEANUP_INTERVAL_MS,
       86_400_000, // 24 hours
     )
+    const outboxRelayIntervalMs = parsePositiveInteger(
+      process.env.OUTBOX_RELAY_INTERVAL_MS,
+      5_000,
+    )
 
     this.enqueue('deadline.check', {
       triggerSource: 'scheduler',
@@ -136,6 +141,7 @@ export class BackgroundJobSystem {
       { delayMs: 5_000 },
     )
     this.enqueue('sessions.cleanup', {}, { delayMs: 10_000 })
+    this.enqueue('outbox.relay', {}, { delayMs: 1_000 })
 
     const deadlineTimer = setInterval(() => {
       this.enqueue('deadline.check', { triggerSource: 'scheduler' })
@@ -152,6 +158,10 @@ export class BackgroundJobSystem {
       this.enqueue('sessions.cleanup', {})
     }, sessionsCleanupIntervalMs)
 
+    const outboxTimer = setInterval(() => {
+      this.enqueue('outbox.relay', {})
+    }, outboxRelayIntervalMs)
+
     if (typeof deadlineTimer.unref === 'function') {
       deadlineTimer.unref()
     }
@@ -161,7 +171,10 @@ export class BackgroundJobSystem {
     if (typeof sessionsTimer.unref === 'function') {
       sessionsTimer.unref()
     }
+    if (typeof outboxTimer.unref === 'function') {
+      outboxTimer.unref()
+    }
 
-    this.scheduleTimers.push(deadlineTimer, analyticsTimer, sessionsTimer)
+    this.scheduleTimers.push(deadlineTimer, analyticsTimer, sessionsTimer, outboxTimer)
   }
 }

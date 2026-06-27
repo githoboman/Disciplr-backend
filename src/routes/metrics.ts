@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import client from 'prom-client';
 import { getDBHealthMetrics } from '../services/dbMetrics.js';
-import { pool } from '../db/index.js';
+import { pool, db } from '../db/index.js';
 import { BackgroundJobSystem } from '../jobs/system.js';
 import { getLatestListenerLag } from '../services/monitor.js';
 
@@ -42,6 +42,12 @@ const listenerLagGauge = new client.Gauge({
   registers: [register],
 });
 
+const outboxLagGauge = new client.Gauge({
+  name: 'disciplr_outbox_relay_lag_seconds',
+  help: 'Outbox relay lag in seconds (oldest unprocessed row age)',
+  registers: [register],
+});
+
 const router = express.Router();
 
 router.get('/metrics', async (_req: Request, res: Response) => {
@@ -63,6 +69,20 @@ router.get('/metrics', async (_req: Request, res: Response) => {
   const lag = getLatestListenerLag();
   if (typeof lag === 'number') {
     listenerLagGauge.set(lag);
+  }
+
+  // Outbox relay lag metric
+  try {
+    const oldestRow = await db('vault_outbox')
+      .where('processed', false)
+      .orderBy('created_at', 'asc')
+      .first();
+    const lagSeconds = oldestRow
+      ? Math.max(0, (Date.now() - new Date(oldestRow.created_at).getTime()) / 1000)
+      : 0;
+    outboxLagGauge.set(lagSeconds);
+  } catch (error) {
+    console.error('Error fetching outbox lag metric:', error);
   }
 
   res.set('Content-Type', register.contentType);
