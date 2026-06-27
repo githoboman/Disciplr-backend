@@ -191,16 +191,48 @@ export class AuthService {
     }
 
     static async registerWebAuthnCredential(userId: string, credentialId: string, publicKey: string) {
+        const existing = await getPrisma().$queryRaw<{ credential_id: string }[]>`
+            SELECT "credential_id" FROM "webauthn_credentials"
+            WHERE "credential_id" = ${credentialId}
+            LIMIT 1
+        `
+
+        if (existing.length > 0) {
+            throw new Error('Credential already registered')
+        }
+
         await getPrisma().$executeRaw`
-            INSERT INTO "webauthn_credentials" ("user_id", "credential_id", "public_key")
-            VALUES (${userId}, ${credentialId}, ${publicKey})
-            ON CONFLICT ("credential_id") DO UPDATE SET
-                "public_key" = EXCLUDED."public_key",
-                "updated_at" = CURRENT_TIMESTAMP,
-                "last_used_at" = CURRENT_TIMESTAMP
+            INSERT INTO "webauthn_credentials" ("user_id", "credential_id", "public_key", "counter")
+            VALUES (${userId}, ${credentialId}, ${publicKey}, 0)
         `
 
         return { userId, credentialId, publicKey }
+    }
+
+    static async verifyWebAuthnAssertion(credentialId: string, newCounter: number) {
+        const rows = await getPrisma().$queryRaw<{ counter: number }[]>`
+            SELECT "counter" FROM "webauthn_credentials"
+            WHERE "credential_id" = ${credentialId}
+            LIMIT 1
+        `
+
+        if (rows.length === 0) {
+            throw new Error('Credential not found')
+        }
+
+        const storedCounter = rows[0].counter
+
+        if (newCounter <= storedCounter) {
+            throw new Error('Counter regression detected: possible cloned authenticator')
+        }
+
+        await getPrisma().$executeRaw`
+            UPDATE "webauthn_credentials"
+            SET "counter" = ${newCounter}, "last_used_at" = CURRENT_TIMESTAMP
+            WHERE "credential_id" = ${credentialId}
+        `
+
+        return { credentialId, counter: newCounter }
     }
 }
 
