@@ -16,7 +16,7 @@ module.exports = {
       },
     ],
   },
-  testMatch: ["**/tests/**/*.test.ts", "**/src/tests/**/*.test.ts"],
+  testMatch: ["**/tests/**/*.test.ts", "**/src/tests/**/*.test.ts", "**/src/repositories/*.test.ts"],
   moduleDirectories: ["node_modules", "<rootDir>/node_modules"],
   clearMocks: true,
 };
