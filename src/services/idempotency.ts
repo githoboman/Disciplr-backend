@@ -2,6 +2,27 @@ import { Knex } from 'knex'
 import { ParsedEvent } from '../types/horizonSync.js'
 import { createHash } from 'node:crypto'
 
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{1,255}$/
+
+export type KeyValidationResult =
+  | { valid: true }
+  | { valid: false; error: string; code: 'INVALID_IDEMPOTENCY_KEY' }
+
+export function validateIdempotencyKey(key: string): KeyValidationResult {
+  if (!key || !IDEMPOTENCY_KEY_RE.test(key)) {
+    return {
+      valid: false,
+      error: 'Idempotency key must be 1–255 characters and contain only letters, digits, hyphens, and underscores.',
+      code: 'INVALID_IDEMPOTENCY_KEY',
+    }
+  }
+  return { valid: true }
+}
+
+export function scopeIdempotencyKey(userId: string, clientKey: string): string {
+  return `${userId}:${clientKey}`
+}
+
 export class IdempotencyConflictError extends Error {
   constructor(message = 'Idempotency key conflict') {
     super(message)

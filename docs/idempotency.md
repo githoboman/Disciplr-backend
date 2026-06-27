@@ -2,7 +2,12 @@
 
 ## Overview
 
-POST `/api/vaults` supports client-controlled idempotency via the `idempotency-key` request header. Sending the same key with an identical payload returns the original response without creating a duplicate vault. Sending the same key with a *different* payload returns a 409 to signal a conflict.
+Select POST endpoints support client-controlled idempotency via the `idempotency-key` request header. Sending the same key with an identical payload returns the original response without creating a duplicate resource. Sending the same key with a *different* payload returns a 409 to signal a conflict.
+
+Covered endpoints:
+
+- `POST /api/vaults`
+- `POST /api/verifications`
 
 ---
 
@@ -33,19 +38,23 @@ idempotency-key: <256 chars>             # exceeds maximum length
 
 ## Behaviour Matrix
 
+The following matrix applies to all covered endpoints. Status codes in the "Created" column differ by endpoint (201 for both vaults and verifications).
+
 | Condition | Status | Notes |
 |-----------|--------|-------|
 | No `idempotency-key` header | 201 | Normal creation; no deduplication |
-| Valid key, first request | 201 | Vault created; response cached server-side |
+| Valid key, first request | 201 | Resource created; response cached server-side |
 | Valid key, repeated request, **same** payload | 200 | Cached response replayed; `idempotency.replayed: true` |
 | Valid key, repeated request, **different** payload | 409 | Conflict; no side effects |
 | Invalid key format | 400 | Key rejected before any business logic |
 
 ---
 
-## Response Shape
+## Response Shapes
 
-### 201 – Created (first request)
+### POST /api/vaults
+
+#### 201 – Created (first request)
 
 ```json
 {
@@ -55,7 +64,7 @@ idempotency-key: <256 chars>             # exceeds maximum length
 }
 ```
 
-### 200 – Replayed (identical payload)
+#### 200 – Replayed (identical payload)
 
 Same body as the original 201, with `idempotency.replayed` set to `true`:
 
@@ -67,7 +76,33 @@ Same body as the original 201, with `idempotency.replayed` set to `true`:
 }
 ```
 
-### 400 – Invalid key format
+### POST /api/verifications
+
+#### 201 – Created (first request)
+
+```json
+{
+  "verification": { "id": "...", "targetId": "...", "result": "approved", ... },
+  "evidenceReference": { "id": "...", "referenceUrl": "...", ... },
+  "idempotency": { "key": "my-key", "replayed": false }
+}
+```
+
+#### 200 – Replayed (identical payload)
+
+Same body as the original 201, with `idempotency.replayed` set to `true`:
+
+```json
+{
+  "verification": { ... },
+  "evidenceReference": { ... },
+  "idempotency": { "key": "my-key", "replayed": true }
+}
+```
+
+### Error Responses (all endpoints)
+
+#### 400 – Invalid key format
 
 ```json
 {
@@ -78,13 +113,13 @@ Same body as the original 201, with `idempotency.replayed` set to `true`:
 }
 ```
 
-### 409 – Conflict (same key, different payload)
+#### 409 – Conflict (same key, different payload)
 
 ```json
 {
   "error": {
     "code": "IDEMPOTENCY_CONFLICT",
-    "message": "Idempotency key has already been used with a different payload."
+    "message": "Idempotency key conflict"
   }
 }
 ```
@@ -98,7 +133,7 @@ Same body as the original 201, with `idempotency.replayed` set to `true`:
 3. **On 5xx or timeout**: retry with the **same** key and **same** payload. The server will deduplicate.
 4. **On 409**: do **not** retry. A different payload was already submitted under this key. Inspect the original request and generate a new key for a new operation.
 5. **On 400 (`INVALID_IDEMPOTENCY_KEY`)**: fix the key format before retrying.
-6. **On 200 (replay)**: treat this identically to a 201. The `vault.id` in the body is the canonical resource identifier.
+6. **On 200 (replay)**: treat this identically to a 201. The resource `id` in the body is the canonical resource identifier.
 
 ---
 
@@ -122,7 +157,7 @@ The value stored in the idempotency cache is always server-generated (never deri
 
 ### Scope of deduplication
 
-The idempotency guarantee covers a single endpoint: `POST /api/vaults`. Other endpoints are not covered and should not be passed this header.
+The idempotency guarantee is per-endpoint. Each endpoint maintains its own key namespace. A key used against `POST /api/vaults` does not conflict with the same key used against `POST /api/verifications`.
 
 ---
 
@@ -131,8 +166,11 @@ The idempotency guarantee covers a single endpoint: `POST /api/vaults`. Other en
 | Component | Location |
 |-----------|----------|
 | Key validation | `src/services/idempotency.ts` → `validateIdempotencyKey` |
+| Key scoping | `src/services/idempotency.ts` → `scopeIdempotencyKey` |
 | Payload hashing | `src/services/idempotency.ts` → `hashRequestPayload` |
 | Store read/write | `src/services/idempotency.ts` → `getIdempotentResponse` / `saveIdempotentResponse` |
-| Route integration | `src/routes/vaults.ts` → `POST /` handler |
-| Unit tests | `src/tests/eventIdempotency.test.ts` (describe blocks: `validateIdempotencyKey`, `hashRequestPayload`, `idempotency store`) |
-| Route-level tests | `tests/vaults.test.ts` and `src/routes/vaults.test.ts` |
+| Route integration (vaults) | `src/routes/vaults.ts` → `POST /` handler |
+| Route integration (verifications) | `src/routes/verifications.ts` → `POST /` handler |
+| Unit tests | `src/tests/eventIdempotency.test.ts` |
+| Route-level tests (vaults) | `tests/vaults.test.ts` and `src/routes/vaults.test.ts` |
+| Route-level tests (verifications) | `src/tests/verifications.idempotency.test.ts` |
