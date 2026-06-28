@@ -713,8 +713,20 @@ const deliverOnce = async (
  */
 export const dispatchWebhookEvent = async (
   payload: WebhookDeliveryPayload,
+  targetSubscriberId?: string,
 ): Promise<WebhookDeliveryResult[]> => {
-  const eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
+  let eligible: WebhookSubscriber[]
+  if (targetSubscriberId) {
+    const sub = await repo.findById(targetSubscriberId)
+    const matchesEvent = sub && (sub.events.length === 0 || sub.events.includes(payload.eventType))
+    if (!sub || sub.organizationId !== payload.organizationId || !sub.active || !matchesEvent) {
+      eligible = []
+    } else {
+      eligible = [sub]
+    }
+  } else {
+    eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
+  }
   const config = getCircuitBreakerConfig()
 
   // Load org allowlist once for the whole dispatch batch (defense in depth)

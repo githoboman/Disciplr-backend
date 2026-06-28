@@ -19,7 +19,7 @@ import { orgAnalyticsRouter } from './routes/orgAnalytics.js'
 import { orgMembersRouter } from './routes/orgMembers.js'
 import { adminRouter } from './routes/admin.js'
 import { adminVerifiersRouter } from './routes/adminVerifiers.js'
-import { adminWebhooksRouter } from './routes/adminWebhooks.js'
+import { adminWebhooksRouter, adminVaultReplayRouter } from './routes/adminWebhooks.js'
 import { verificationsRouter } from './routes/verifications.js'
 import { apiKeysRouter } from './routes/apiKeys.js'
 import { notificationsRouter } from './routes/notifications.js'
@@ -74,6 +74,7 @@ export function bootstrapApp(options: BootstrapOptions = {}) {
   app.use('/api/admin', adminRouter)
   app.use('/api/admin/verifiers', adminVerifiersRouter)
   app.use('/api/admin/webhooks', adminWebhooksRouter)
+  app.use('/api/admin/vaults', adminVaultReplayRouter)
   app.use('/api/verifications', verificationsRouter)
   app.use('/api/api-keys', apiKeysRouter)
   app.use('/api/notifications', notificationsRouter)
