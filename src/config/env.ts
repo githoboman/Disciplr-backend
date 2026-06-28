@@ -219,6 +219,20 @@ export const envSchema = z
     HTTP_KEEPALIVE_TIMEOUT_MS: positiveInt(45_000),
     HTTP_HEADERS_TIMEOUT_MS: positiveInt(61_000),
     HTTP_REQUEST_TIMEOUT_MS: positiveInt(120_000),
+
+    // ── Admin / Debug ──────────────────────────────────────────────
+    ADMIN_API_KEY: z.string().default(""),
+
+    // ── Log sampling ───────────────────────────────────────────────
+    LOG_SAMPLE_RATE: z
+      .string()
+      .default("1")
+      .transform((v) => {
+        const n = Number.parseFloat(v);
+        return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 1;
+      }),
+    LOG_SLOW_THRESHOLD_MS: positiveInt(1000),
+    LOG_ALWAYS_LOG_STATUS: z.string().default("500,502,503"),
   })
   .superRefine((data, ctx) => {
     // Existing CORS warning
