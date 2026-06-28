@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express'
+import { Router, Request, Response, NextFunction } from 'express'
 import { requireAdmin } from '../middleware/rbac.js'
 import { queryParser } from '../middleware/queryParser.js'
 import { authenticate } from '../middleware/auth.js'
@@ -14,7 +14,7 @@ import {
   verifyAuditLogChain,
 } from '../lib/audit-logs.js'
 import { cancelVaultById } from '../services/vaultStore.js'
-import { getDBHealthMetrics } from '../services/dbMetrics.js'
+import { getDBHealthMetrics, getSlowQueryBuffer } from '../services/dbMetrics.js'
 import {
   getFlag,
   setFlag,
@@ -25,6 +25,7 @@ import {
 import { pool } from '../db/index.js'
 import { db } from '../db/knex.js'
 import { getAbuseCategoryCounts } from '../security/abuse-monitor.js'
+import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { CheckpointStore } from '../services/checkpointStore.js'
 import { getLatestListenerLag } from '../services/monitor.js'
 import { generateImpersonationToken } from '../lib/auth-utils.js'
@@ -760,6 +761,23 @@ adminRouter.get('/db/metrics', metricsRateLimiter, async (req: Request, res: Res
     console.error('Error retrieving DB metrics:', error)
     res.status(500).json({ error: 'Failed to retrieve database metrics' })
   }
+})
+
+/**
+ * GET /api/admin/db/slow-queries
+ * Returns the ring-buffered slow-query samples (admin only).
+ * Entries are ordered oldest → newest; fingerprints only, no raw parameters.
+ */
+adminRouter.get('/db/slow-queries', (req: Request, res: Response) => {
+  const entries = getSlowQueryBuffer()
+  res.status(200).json({
+    data: {
+      count: entries.length,
+      thresholdMs: (() => { const v = parseInt(process.env.SLOW_QUERY_THRESHOLD_MS ?? '200', 10); return Math.max(0, isNaN(v) ? 200 : v) })(),
+      bufferSize: (() => { const v = parseInt(process.env.SLOW_QUERY_BUFFER_SIZE ?? '100', 10); return Math.max(1, isNaN(v) ? 100 : v) })(),
+      entries,
+    },
+  })
 })
 
 /**
