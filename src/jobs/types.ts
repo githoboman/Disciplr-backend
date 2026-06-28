@@ -11,6 +11,7 @@ export const JOB_TYPES = [
   'sessions.cleanup',
   'outbox.relay',
   'embeddings.reindex',
+  'saved-search.evaluate',
 ] as const
 
 export type JobType = (typeof JOB_TYPES)[number]
@@ -75,6 +76,10 @@ export interface EmbeddingsReindexJobPayload {
   maxBatchesPerRun?: number
 }
 
+export interface SavedSearchEvaluateJobPayload {
+  searchId?: string
+}
+
 export interface JobPayloadByType {
   'notification.send': NotificationJobPayload
   'deadline.check': DeadlineCheckJobPayload
@@ -88,6 +93,7 @@ export interface JobPayloadByType {
   'sessions.cleanup': SessionsCleanupJobPayload
   'outbox.relay': OutboxRelayJobPayload
   'embeddings.reindex': EmbeddingsReindexJobPayload
+  'saved-search.evaluate': SavedSearchEvaluateJobPayload
 }
 
 export interface JobContext {
@@ -187,6 +193,8 @@ export const isPayloadForJobType = (
         (payload.maxBatchesPerRun === undefined ||
           (typeof payload.maxBatchesPerRun === 'number' && payload.maxBatchesPerRun > 0))
       )
+    case 'saved-search.evaluate':
+      return payload.searchId === undefined || typeof payload.searchId === 'string'
     default:
       return false
   }
