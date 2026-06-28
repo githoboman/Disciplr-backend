@@ -4,6 +4,13 @@ import { queryParser } from '../middleware/queryParser.js'
 import { authenticate } from '../middleware/auth.js'
 import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { requireStepUp } from '../middleware/stepUp.js'
+import {
+  requireConfirmationToken,
+  issueConfirmationToken,
+  approveConfirmationToken,
+  isDualControlRequired,
+  VALID_DESTRUCTIVE_ACTIONS,
+} from '../middleware/confirmationToken.js'
 import { UserRole, UserStatus } from '../types/user.js'
 import { userService, DeleteResult } from '../services/user.service.js'
 import { forceRevokeUserSessions } from '../services/session.js'
@@ -26,7 +33,6 @@ import {
 import { pool } from '../db/index.js'
 import { db } from '../db/knex.js'
 import { getAbuseCategoryCounts } from '../security/abuse-monitor.js'
-import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { CheckpointStore } from '../services/checkpointStore.js'
 import { getLatestListenerLag } from '../services/monitor.js'
 import { generateImpersonationToken } from '../lib/auth-utils.js'
@@ -129,6 +135,95 @@ adminRouter.use(authenticate)
 adminRouter.use(requireAdmin)
 
 /**
+ * POST /api/admin/confirm/prepare
+ * Issues a short-lived, action-scoped confirmation token for a destructive action.
+ * For dual-control actions a second admin must approve via /confirm/approve/:tokenId
+ * before the token can be consumed.
+ */
+adminRouter.post('/confirm/prepare', async (req: Request, res: Response) => {
+  const { action, scope } = req.body ?? {}
+
+  if (!action || typeof action !== 'string') {
+    res.status(400).json({
+      error: 'action is required',
+      validActions: [...VALID_DESTRUCTIVE_ACTIONS],
+    })
+    return
+  }
+
+  if (!VALID_DESTRUCTIVE_ACTIONS.has(action)) {
+    res.status(400).json({
+      error: `Invalid action. Must be one of: ${[...VALID_DESTRUCTIVE_ACTIONS].join(', ')}`,
+      validActions: [...VALID_DESTRUCTIVE_ACTIONS],
+    })
+    return
+  }
+
+  const entry = issueConfirmationToken(req.user!.userId, action, scope ?? undefined)
+
+  await createAuditLog({
+    actor_user_id: req.user!.userId,
+    action: 'admin.destructive_action.prepared',
+    target_type: 'confirmation_token',
+    target_id: entry.tokenId,
+    metadata: {
+      destructive_action: action,
+      scope: scope ?? null,
+      dual_control_required: entry.dualControlRequired,
+      expires_at: new Date(entry.expiresAt).toISOString(),
+    },
+  })
+
+  res.status(201).json({
+    tokenId: entry.tokenId,
+    action,
+    scope: entry.scope ?? null,
+    expiresAt: new Date(entry.expiresAt).toISOString(),
+    dualControlRequired: entry.dualControlRequired,
+    ...(entry.dualControlRequired
+      ? { approveUrl: `/api/admin/confirm/approve/${entry.tokenId}` }
+      : {}),
+  })
+})
+
+/**
+ * POST /api/admin/confirm/approve/:tokenId
+ * Second-admin approval for a dual-control confirmation token.
+ * The approver must be a different admin from the one who prepared the token.
+ */
+adminRouter.post('/confirm/approve/:tokenId', async (req: Request, res: Response) => {
+  const { tokenId } = req.params
+  const result = approveConfirmationToken(tokenId, req.user!.userId)
+
+  if (!result.ok) {
+    const status = result.reason === 'token_not_found' ? 404 : 409
+    res.status(status).json({ error: result.reason })
+    return
+  }
+
+  await createAuditLog({
+    actor_user_id: req.user!.userId,
+    action: 'admin.destructive_action.approved',
+    target_type: 'confirmation_token',
+    target_id: tokenId,
+    metadata: {
+      destructive_action: result.entry.action,
+      scope: result.entry.scope ?? null,
+      prepared_by: result.entry.userId,
+      approved_by: req.user!.userId,
+      approved_at: new Date(result.entry.approvedAt!).toISOString(),
+    },
+  })
+
+  res.status(200).json({
+    tokenId,
+    action: result.entry.action,
+    approvedBy: req.user!.userId,
+    approvedAt: new Date(result.entry.approvedAt!).toISOString(),
+  })
+})
+
+/**
  * GET /api/admin/horizon/listener
  * Detailed Horizon listener status for operators.
  */
@@ -195,7 +290,7 @@ adminRouter.get('/horizon/listener', async (_req: Request, res: Response) => {
  * POST /api/admin/horizon/listener/reset-cursor
  * Safely resets the resumable cursor for a Horizon contract.
  */
-adminRouter.post('/horizon/listener/reset-cursor', async (req: Request, res: Response) => {
+adminRouter.post('/horizon/listener/reset-cursor', requireConfirmationToken('horizon.cursor.reset'), async (req: Request, res: Response) => {
   try {
     const { contractAddress, ledger, pagingToken, force = false, reason } = req.body ?? {}
 
@@ -622,7 +717,12 @@ adminRouter.patch('/users/:id/status', async (req, res) => {
   }
 })
 
-adminRouter.delete('/users/:id', async (req, res) => {
+adminRouter.delete(
+  '/users/:id',
+  requireConfirmationToken((req) =>
+    req.query.hard === 'true' ? 'user.hard_delete' : 'user.soft_delete',
+  ),
+  async (req, res) => {
   try {
     const hard = req.query.hard === 'true'
     const targetUser = await userService.getUserById(req.params.id, true)
@@ -899,7 +999,7 @@ adminRouter.get('/embeddings/drift', async (req: Request, res: Response) => {
  *
  * Optional body: { reset_cursor?: boolean, max_batches?: number }
  */
-adminRouter.post('/embeddings/reembed', async (req: Request, res: Response) => {
+adminRouter.post('/embeddings/reembed', requireConfirmationToken('embeddings.force_resync'), async (req: Request, res: Response) => {
   try {
     const { reset_cursor = false, max_batches } = req.body ?? {}
 
