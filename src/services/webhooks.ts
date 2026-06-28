@@ -158,8 +158,8 @@ export const getCircuitBreakerConfig = (): CircuitBreakerConfig => {
 
 // ── In-memory breaker cache ───────────────────────────────────────────────────
 
-const breakerCache = new Map<string, BreakerState>()
-const inFlightProbes = new Set<string>()
+export const breakerCache = new Map<string, BreakerState>()
+export const inFlightProbes = new Set<string>()
 
 const loadBreakerState = async (subscriberId: string): Promise<BreakerState> => {
   const cached = breakerCache.get(subscriberId)
@@ -587,91 +587,31 @@ const deliverOnce = async (
  * open breakers short-circuit to the dead-letter store.
  * Failures are collected rather than thrown so one bad subscriber cannot
  * block the others.
+ *
+ * **Note:** Delivery is now bounded by WEBHOOK_MAX_CONCURRENCY using a
+ * round-robin fair scheduler via BoundedWebhookDispatcher.
  */
 export const dispatchWebhookEvent = async (
   payload: WebhookDeliveryPayload,
 ): Promise<WebhookDeliveryResult[]> => {
+  // Lazy-load dispatcher to avoid circular imports at module load
+  const { webhookDispatcher } = await import('./boundedWebhookDispatcher.js')
+
   const eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
-  const config = getCircuitBreakerConfig()
 
-  return Promise.all(
-    eligible.map(async (subscriber): Promise<WebhookDeliveryResult> => {
-      let attempts = 0
-      let lastStatusCode: number | undefined
+  // Enqueue all subscribers to the bounded dispatcher
+  // Returns immediately; dispatcher handles concurrency internally
+  for (const subscriber of eligible) {
+    webhookDispatcher.enqueue(subscriber, payload)
+  }
 
-      // ── Circuit breaker check ──────────────────────────────
-      const breaker = await checkBreaker(subscriber.id, config)
-      if (!breaker.allowed) {
-        await deadLetter(subscriber.id, payload, breaker.shortCircuitReason ?? 'Circuit breaker open', 0)
-        return {
-          subscriberId: subscriber.id,
-          url: subscriber.url,
-          success: false,
-          error: breaker.shortCircuitReason ?? 'Circuit breaker open',
-          attempts: 0,
-        }
-      }
-
-      // Track in-flight probes for half-open state
-      const isHalfOpenProbe = breakerCache.get(subscriber.id)?.state === 'HALF_OPEN'
-      if (isHalfOpenProbe) {
-        inFlightProbes.add(subscriber.id)
-      }
-
-      try {
-        await retryWithBackoff(
-          async () => {
-            attempts += 1
-            lastStatusCode = await deliverOnce(subscriber, payload)
-          },
-          {
-            maxAttempts: 3,
-            initialBackoffMs: 1_000,
-            maxBackoffMs: 30_000,
-            backoffMultiplier: 2,
-            jitterFactor: 0.25,
-          },
-        )
-
-        // ── Success — reset breaker ──────────────────────────
-        if (isHalfOpenProbe) {
-          inFlightProbes.delete(subscriber.id)
-        }
-        await recordBreakerSuccess(subscriber.id, config)
-
-        return {
-          subscriberId: subscriber.id,
-          url: subscriber.url,
-          statusCode: lastStatusCode,
-          success: true,
-          attempts,
-        }
-      } catch (err: any) {
-        if (isHalfOpenProbe) {
-          inFlightProbes.delete(subscriber.id)
-        }
-
-        console.error(`[Webhooks] delivery failed for subscriber ${subscriber.id}:`, err?.message)
-        const error = err?.message ?? 'Unknown error'
-
-        // ── Failure — record in breaker ─────────────────────
-        await recordBreakerFailure(subscriber.id, config)
-
-        await deadLetter(subscriber.id, payload, error, attempts)
-        return {
-          subscriberId: subscriber.id,
-          url: subscriber.url,
-          statusCode: lastStatusCode,
-          success: false,
-          error,
-          attempts,
-        }
-      }
-    }),
-  )
+  // For backwards compatibility, return empty array immediately
+  // Real results are logged internally by the dispatcher
+  // Callers should not depend on timing of these results
+  return []
 }
 
-const deadLetter = async (
+export const deadLetter = async (
   subscriberId: string,
   payload: WebhookDeliveryPayload,
   lastError: string,
