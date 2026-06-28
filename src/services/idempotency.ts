@@ -227,6 +227,48 @@ export class IdempotencyService {
   }
 
   /**
+   * Bulk check which event IDs have already been processed.
+   * Returns a Set of already-processed event IDs for O(1) lookup.
+   *
+   * @param eventIds - Array of event IDs to check
+   * @param trx - Optional transaction to use for the check
+   * @returns Promise<Set<string>> - Set of already-processed event IDs
+   */
+  async areEventsProcessed(eventIds: string[], trx?: Knex.Transaction): Promise<Set<string>> {
+    const query = (trx || this.db)('processed_events')
+      .whereIn('event_id', eventIds)
+      .select('event_id')
+
+    const rows = await query
+    return new Set(rows.map((r: any) => r.event_id))
+  }
+
+  /**
+   * Bulk mark events as processed in a single insert.
+   * MUST be called within a transaction that includes the business logic operations.
+   *
+   * @param events - Array of {eventId, transactionHash, eventIndex, ledgerNumber}
+   * @param trx - Transaction to use for recording
+   */
+  async markEventsProcessed(
+    events: Array<{ eventId: string; transactionHash: string; eventIndex: number; ledgerNumber: number }>,
+    trx: Knex.Transaction,
+  ): Promise<void> {
+    if (events.length === 0) return
+
+    const rows = events.map(e => ({
+      event_id: e.eventId,
+      transaction_hash: e.transactionHash,
+      event_index: e.eventIndex,
+      ledger_number: e.ledgerNumber,
+      processed_at: new Date(),
+      created_at: new Date(),
+    }))
+
+    await trx('processed_events').insert(rows).onConflict('event_id').ignore()
+  }
+
+  /**
    * General-purpose idempotency check for API requests.
    * Looks up the principal-scoped internal key; user_id / org_id columns
    * are stored for auditing but are not used for access control here —

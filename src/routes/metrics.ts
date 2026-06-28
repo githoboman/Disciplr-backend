@@ -68,6 +68,20 @@ const webhookBreakerHalfOpenGauge = new client.Gauge({
   registers: [register],
 });
 
+const eventThroughputGauge = new client.Gauge({
+  name: 'disciplr_event_throughput_events_per_sec',
+  help: 'Event processing throughput in events per second (batched path)',
+  registers: [register],
+});
+
+/**
+ * Update the event throughput metric from the batch processor.
+ * Called by EventProcessor after each completed batch.
+ */
+export function setEventThroughput(eventsPerSec: number): void {
+  eventThroughputGauge.set(eventsPerSec);
+}
+
 const router = express.Router();
 
 router.get('/metrics', async (_req: Request, res: Response) => {
