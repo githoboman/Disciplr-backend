@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { recordSession, revokeAllUserSessions } from './session.js'
 
 const STEP_UP_TTL_SECONDS = 5 * 60
-const STEP_UP_NONCES = new Map<string, { userId: string; expiresAt: number; used: boolean }>()
+const STEP_UP_NONCES = new Map<string, { userId: string; action?: string; expiresAt: number; used: boolean }>()
 
 export class AuthService {
     static async register(input: RegisterInput) {
@@ -149,10 +149,10 @@ export class AuthService {
         await revokeAllUserSessions(userId)
     }
 
-    static async issueStepUpChallenge(userId: string) {
+    static async issueStepUpChallenge(userId: string, action?: string) {
         const nonce = randomUUID()
         const expiresAt = Date.now() + STEP_UP_TTL_SECONDS * 1000
-        STEP_UP_NONCES.set(nonce, { userId, expiresAt, used: false })
+        STEP_UP_NONCES.set(nonce, { userId, action, expiresAt, used: false })
 
         return {
             nonce,
@@ -173,7 +173,7 @@ export class AuthService {
         return true
     }
 
-    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS) {
+    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS, action?: string) {
         const entry = STEP_UP_NONCES.get(sessionId)
         if (!entry || entry.used || entry.expiresAt < Date.now()) {
             return null
@@ -182,6 +182,10 @@ export class AuthService {
         const maxAgeMs = maxAgeSeconds * 1000
         const isFresh = entry.expiresAt - Date.now() <= maxAgeMs
         if (!isFresh) {
+            return null
+        }
+
+        if (action && entry.action && entry.action !== action) {
             return null
         }
 

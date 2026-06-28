@@ -98,13 +98,15 @@ function getCacheProvider() {
 export async function getOrSet<T>(
   key: string,
   ttlSeconds: number,
-  loader: () => Promise<T>
+  loader: () => Promise<T>,
+  orgId?: string
 ): Promise<T> {
   const { redisClient, memoryCache } = getCacheProvider();
+  const cacheKey = orgId ? `org:${orgId}:${key}` : key;
 
   if (redisClient) {
     try {
-      const cached = await redisClient.get(key);
+      const cached = await redisClient.get(cacheKey);
       if (cached) {
         const parsed = JSON.parse(cached);
         if (parsed && parsed.version === CACHE_VERSION) {
@@ -112,10 +114,10 @@ export async function getOrSet<T>(
         }
       }
     } catch (error) {
-      console.warn(`Redis get failed for key ${key}:`, error);
+      console.warn(`Redis get failed for key ${cacheKey}:`, error);
     }
   } else if (memoryCache) {
-    const cachedData = await memoryCache.get(key);
+    const cachedData = await memoryCache.get(cacheKey);
     if (cachedData !== null) {
       return cachedData as T;
     }
@@ -128,47 +130,49 @@ export async function getOrSet<T>(
   const entry = { version: CACHE_VERSION, data };
   if (redisClient) {
     try {
-      await redisClient.set(key, JSON.stringify(entry), 'EX', ttlSeconds);
+      await redisClient.set(cacheKey, JSON.stringify(entry), 'EX', ttlSeconds);
     } catch (error) {
-      console.warn(`Redis set failed for key ${key}:`, error);
+      console.warn(`Redis set failed for key ${cacheKey}:`, error);
     }
   } else if (memoryCache) {
-    await memoryCache.set(key, data, Date.now() + ttlSeconds * 1000);
+    await memoryCache.set(cacheKey, data, Date.now() + ttlSeconds * 1000);
   }
 
   return data;
 }
 
-export async function invalidate(key: string): Promise<void> {
+export async function invalidate(key: string, orgId?: string): Promise<void> {
   const { redisClient, memoryCache } = getCacheProvider();
+  const cacheKey = orgId ? `org:${orgId}:${key}` : key;
   if (redisClient) {
     try {
-      await redisClient.del(key);
+      await redisClient.unlink(cacheKey);
     } catch (error) {
-      console.warn(`Redis del failed for key ${key}:`, error);
+      console.warn(`Redis unlink failed for key ${cacheKey}:`, error);
     }
   } else if (memoryCache) {
-    await memoryCache.invalidate(key);
+    await memoryCache.invalidate(cacheKey);
   }
 }
 
-export async function invalidatePrefix(prefix: string): Promise<void> {
+export async function invalidatePrefix(prefix: string, orgId?: string): Promise<void> {
   const { redisClient, memoryCache } = getCacheProvider();
+  const cachePrefix = orgId ? `org:${orgId}:${prefix}` : prefix;
   if (redisClient) {
     try {
       let cursor = '0';
       do {
-        const [nextCursor, keys] = await redisClient.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+        const [nextCursor, keys] = await redisClient.scan(cursor, 'MATCH', `${cachePrefix}*`, 'COUNT', 100);
         cursor = nextCursor;
         if (keys.length > 0) {
-          await redisClient.del(...keys);
+          await redisClient.unlink(...keys);
         }
       } while (cursor !== '0');
     } catch (error) {
-      console.warn(`Redis invalidatePrefix failed for prefix ${prefix}:`, error);
+      console.warn(`Redis invalidatePrefix failed for prefix ${cachePrefix}:`, error);
     }
   } else if (memoryCache) {
-    await memoryCache.invalidatePrefix(prefix);
+    await memoryCache.invalidatePrefix(cachePrefix);
   }
 }
 

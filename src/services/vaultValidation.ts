@@ -72,6 +72,8 @@ export const createVaultSchema = z
       .min(VAULT_MILESTONES_MIN, 'must contain at least one item')
       .max(VAULT_MILESTONES_MAX, `must contain at most ${VAULT_MILESTONES_MAX} items`),
     creator: stellarAddressSchema.optional(),
+    orgId: z.string().uuid().optional(),
+    organizationId: z.string().uuid().optional(),
     /**
      * Grace window in seconds after a milestone dueDate during which check-in
      * is still accepted. Must be a non-negative integer. Bounded at runtime by

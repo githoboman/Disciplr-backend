@@ -1,7 +1,8 @@
-import { Router, Request, Response } from 'express'
+import { Router, Request, Response, NextFunction } from 'express'
 import { requireAdmin } from '../middleware/rbac.js'
 import { queryParser } from '../middleware/queryParser.js'
 import { authenticate } from '../middleware/auth.js'
+import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { requireStepUp } from '../middleware/stepUp.js'
 import { UserRole, UserStatus } from '../types/user.js'
 import { userService, DeleteResult } from '../services/user.service.js'
@@ -14,7 +15,7 @@ import {
   verifyAuditLogChain,
 } from '../lib/audit-logs.js'
 import { cancelVaultById } from '../services/vaultStore.js'
-import { getDBHealthMetrics } from '../services/dbMetrics.js'
+import { getDBHealthMetrics, getSlowQueryBuffer } from '../services/dbMetrics.js'
 import {
   getFlag,
   setFlag,
@@ -25,12 +26,21 @@ import {
 import { pool } from '../db/index.js'
 import { db } from '../db/knex.js'
 import { getAbuseCategoryCounts } from '../security/abuse-monitor.js'
+import { metricsRateLimiter } from '../middleware/rateLimiter.js'
 import { CheckpointStore } from '../services/checkpointStore.js'
 import { getLatestListenerLag } from '../services/monitor.js'
 import { generateImpersonationToken } from '../lib/auth-utils.js'
 import { getPrisma } from '../lib/prismaScope.js'
 import { recordSession } from '../services/session.js'
 import { randomUUID } from 'node:crypto'
+import {
+  detectEmbeddingDrift,
+  CURRENT_EMBEDDING_MODEL_VERSION,
+  createEmbeddingProvider,
+} from '../services/embeddingProvider.js'
+import { runReindexBatches, EMBEDDING_REINDEX_JOB_NAME } from '../services/evidenceReindex.js'
+import { MilestoneRepository } from '../repositories/milestoneRepository.js'
+import { BackfillCursorStore } from '../services/backfillCursorStore.js'
 
 export const adminRouter = Router()
 
@@ -763,6 +773,23 @@ adminRouter.get('/db/metrics', metricsRateLimiter, async (req: Request, res: Res
 })
 
 /**
+ * GET /api/admin/db/slow-queries
+ * Returns the ring-buffered slow-query samples (admin only).
+ * Entries are ordered oldest → newest; fingerprints only, no raw parameters.
+ */
+adminRouter.get('/db/slow-queries', (req: Request, res: Response) => {
+  const entries = getSlowQueryBuffer()
+  res.status(200).json({
+    data: {
+      count: entries.length,
+      thresholdMs: (() => { const v = parseInt(process.env.SLOW_QUERY_THRESHOLD_MS ?? '200', 10); return Math.max(0, isNaN(v) ? 200 : v) })(),
+      bufferSize: (() => { const v = parseInt(process.env.SLOW_QUERY_BUFFER_SIZE ?? '100', 10); return Math.max(1, isNaN(v) ? 100 : v) })(),
+      entries,
+    },
+  })
+})
+
+/**
  * GET /api/admin/abuse/category-counts
  * Returns per-category abuse event counts (brute-force, enumeration, payload-anomaly, rate-limit-trip).
  * Admin only.
@@ -833,5 +860,83 @@ adminRouter.post('/impersonate/:userId', requireStepUp(), async (req: Request, r
     })
   } catch (error: any) {
     next(error)
+  }
+})
+
+// ── Embedding drift ───────────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/embeddings/drift
+ *
+ * Returns a breakdown of stored embeddings grouped by model_version,
+ * indicating how many are stale vs current.
+ */
+adminRouter.get('/embeddings/drift', async (req: Request, res: Response) => {
+  try {
+    const report = await detectEmbeddingDrift(db)
+
+    await createAuditLog({
+      actor_user_id: req.user!.userId,
+      action: 'admin.embeddings.drift.read',
+      target_type: 'embedding_drift_report',
+      target_id: report.currentModelVersion,
+      metadata: { staleCount: report.staleCount, totalEmbeddings: report.totalEmbeddings },
+    })
+
+    res.status(200).json(report)
+  } catch (error) {
+    console.error('Error fetching embedding drift report:', error)
+    res.status(500).json({ error: 'Failed to fetch embedding drift report' })
+  }
+})
+
+/**
+ * POST /api/admin/embeddings/reembed
+ *
+ * Enqueues an incremental re-embed run for stale milestone embeddings.
+ * Resumable: uses the backfill cursor store so a second call continues
+ * from where the previous run stopped.
+ *
+ * Optional body: { reset_cursor?: boolean, max_batches?: number }
+ */
+adminRouter.post('/embeddings/reembed', async (req: Request, res: Response) => {
+  try {
+    const { reset_cursor = false, max_batches } = req.body ?? {}
+
+    const milestoneRepo = new MilestoneRepository(db)
+    const cursorStore = new BackfillCursorStore(db)
+
+    if (reset_cursor === true) {
+      await cursorStore.resetCursor(EMBEDDING_REINDEX_JOB_NAME)
+    }
+
+    const provider = createEmbeddingProvider()
+
+    const result = await runReindexBatches({
+      source: milestoneRepo,
+      cursorStore,
+      embeddingProvider: provider,
+      ...(typeof max_batches === 'number' && max_batches > 0 ? { maxBatchesPerRun: max_batches } : {}),
+    })
+
+    await createAuditLog({
+      actor_user_id: req.user!.userId,
+      action: 'admin.embeddings.reembed.triggered',
+      target_type: 'embedding_reindex',
+      target_id: CURRENT_EMBEDDING_MODEL_VERSION,
+      metadata: {
+        batches: result.batches,
+        reindexed: result.reindexed,
+        skippedUpToDate: result.skippedUpToDate,
+        done: result.done,
+        cursor: result.cursor,
+        resetCursor: reset_cursor,
+      },
+    })
+
+    res.status(202).json(result)
+  } catch (error) {
+    console.error('Error triggering embedding re-embed:', error)
+    res.status(500).json({ error: 'Failed to trigger re-embed' })
   }
 })

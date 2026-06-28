@@ -174,3 +174,62 @@ This dual validation ensures that:
 - Blocked SSRF attempts are logged (without URL details) for security audits
 - Evidence references are immutable (created via `ON CONFLICT DO UPDATE`) — once accepted, the URL cannot be changed
 - All URL validation is deterministic and testable (see `src/tests/evidence.ssrf.test.ts`)
+
+## Embedding Model-Version Drift Detection
+
+Each row in `milestone_embeddings` records the `model_version` that produced it. When the active provider version (controlled by `EMBEDDING_MODEL_VERSION`) changes, stored embeddings become stale and silently degrade similarity search.
+
+### Drift report
+
+```
+GET /api/admin/embeddings/drift
+Authorization: Bearer <admin-token>
+```
+
+Response:
+```json
+{
+  "currentModelVersion": "deterministic-v2",
+  "totalEmbeddings": 1000,
+  "currentCount": 750,
+  "staleCount": 250,
+  "versions": [
+    { "modelVersion": "deterministic-v1", "count": 200, "isCurrent": false },
+    { "modelVersion": "legacy-unversioned", "count": 50, "isCurrent": false },
+    { "modelVersion": "deterministic-v2", "count": 750, "isCurrent": true }
+  ]
+}
+```
+
+### Triggering a re-embed
+
+```
+POST /api/admin/embeddings/reembed
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{ "reset_cursor": false, "max_batches": 5 }
+```
+
+- `reset_cursor` (default `false`) — set to `true` to restart the backfill from the beginning.
+- `max_batches` (default `5`) — maximum batches to process per call. Each batch is `50` milestones.
+
+The run is **incremental and resumable**: the backfill cursor is persisted in `backfill_cursors` under job name `milestone-evidence-embedding-reindex`. A crashed or timed-out run picks up where it left off on the next call.
+
+Rows already on the current model version are skipped (no double-processing).
+
+Response (`202 Accepted`):
+```json
+{
+  "batches": 5,
+  "processed": 250,
+  "reindexed": 200,
+  "skippedUpToDate": 50,
+  "cursor": "m-00250",
+  "done": false
+}
+```
+
+Call repeatedly until `done: true`.
+
+Both endpoints are admin-only and audit-logged under `admin.embeddings.drift.read` and `admin.embeddings.reembed.triggered`.
