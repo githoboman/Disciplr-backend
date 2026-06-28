@@ -198,6 +198,7 @@ export class BackgroundJobSystem {
     this.queue.registerHandler('sessions.cleanup', handlers['sessions.cleanup'])
     this.queue.registerHandler('outbox.relay', handlers['outbox.relay'])
     this.queue.registerHandler('embeddings.reindex', handlers['embeddings.reindex'])
+    this.queue.registerHandler('saved-search.evaluate', handlers['saved-search.evaluate'])
   }
 
   start(): void {
@@ -296,6 +297,10 @@ export class BackgroundJobSystem {
       process.env.EMBEDDING_REINDEX_INTERVAL_MS,
       600_000, // 10 minutes
     )
+    const savedSearchEvalIntervalMs = parsePositiveInteger(
+      process.env.SAVED_SEARCH_EVAL_INTERVAL_MS,
+      15 * 60_000, // 15 minutes
+    )
 
     this.schedulerRegistry.registerJob({
       name: 'deadline.check',
@@ -346,6 +351,15 @@ export class BackgroundJobSystem {
       initialDelayMs: 15_000,
       execute: () => {
         this.enqueue('embeddings.reindex', {})
+      },
+    })
+
+    this.schedulerRegistry.registerJob({
+      name: 'saved-search.evaluate',
+      intervalMs: savedSearchEvalIntervalMs,
+      immediate: false,
+      execute: () => {
+        this.enqueue('saved-search.evaluate', {})
       },
     })
   }
