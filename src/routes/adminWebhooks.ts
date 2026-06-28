@@ -10,6 +10,7 @@ import {
   rotateSubscriberSecret,
   listSubscribers,
 } from '../services/webhooks.js'
+import { isPaused, pauseDelivery, resumeDelivery } from '../services/pauseStore.js'
 
 export const adminWebhooksRouter = Router()
 
@@ -217,3 +218,54 @@ adminWebhooksRouter.post(
     }
   },
 )
+
+/**
+ * GET /api/admin/webhooks/pause/status
+ *
+ * Returns the current delivery-pause state.
+ */
+adminWebhooksRouter.get('/pause/status', (_req: Request, res: Response) => {
+  res.status(200).json({ paused: isPaused() })
+})
+
+/**
+ * POST /api/admin/webhooks/pause
+ *
+ * Halts all outbound webhook delivery.  Events continue to accumulate in the
+ * outbox and will be dispatched once the system is resumed.  Idempotent —
+ * calling while already paused is a no-op.
+ */
+adminWebhooksRouter.post('/pause', (req: Request, res: Response) => {
+  pauseDelivery()
+
+  createAuditLog({
+    actor_user_id: req.user!.userId,
+    action: 'webhook.delivery.paused',
+    target_type: 'webhook_global',
+    target_id: 'global',
+    metadata: {},
+  })
+
+  res.status(200).json({ paused: true })
+})
+
+/**
+ * POST /api/admin/webhooks/resume
+ *
+ * Re-enables outbound webhook delivery.  The outbox relay will drain the
+ * backlog on its next tick, respecting existing backoff/breaker state.
+ * Idempotent — calling while already resumed is a no-op.
+ */
+adminWebhooksRouter.post('/resume', (req: Request, res: Response) => {
+  resumeDelivery()
+
+  createAuditLog({
+    actor_user_id: req.user!.userId,
+    action: 'webhook.delivery.resumed',
+    target_type: 'webhook_global',
+    target_id: 'global',
+    metadata: {},
+  })
+
+  res.status(200).json({ paused: false })
+})
