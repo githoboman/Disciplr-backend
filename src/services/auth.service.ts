@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { recordSession, revokeAllUserSessions } from './session.js'
 
 const STEP_UP_TTL_SECONDS = 5 * 60
-const STEP_UP_NONCES = new Map<string, { userId: string; expiresAt: number; used: boolean }>()
+const STEP_UP_NONCES = new Map<string, { userId: string; action?: string; expiresAt: number; used: boolean }>()
 
 export class AuthService {
     static async register(input: RegisterInput) {
@@ -149,10 +149,10 @@ export class AuthService {
         await revokeAllUserSessions(userId)
     }
 
-    static async issueStepUpChallenge(userId: string) {
+    static async issueStepUpChallenge(userId: string, action?: string) {
         const nonce = randomUUID()
         const expiresAt = Date.now() + STEP_UP_TTL_SECONDS * 1000
-        STEP_UP_NONCES.set(nonce, { userId, expiresAt, used: false })
+        STEP_UP_NONCES.set(nonce, { userId, action, expiresAt, used: false })
 
         return {
             nonce,
@@ -173,7 +173,7 @@ export class AuthService {
         return true
     }
 
-    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS) {
+    static async validateStepUpSession(sessionId: string, maxAgeSeconds = STEP_UP_TTL_SECONDS, action?: string) {
         const entry = STEP_UP_NONCES.get(sessionId)
         if (!entry || entry.used || entry.expiresAt < Date.now()) {
             return null
@@ -185,22 +185,58 @@ export class AuthService {
             return null
         }
 
+        if (action && entry.action && entry.action !== action) {
+            return null
+        }
+
         entry.used = true
         STEP_UP_NONCES.delete(sessionId)
         return { userId: entry.userId, sessionId }
     }
 
     static async registerWebAuthnCredential(userId: string, credentialId: string, publicKey: string) {
+        const existing = await getPrisma().$queryRaw<{ credential_id: string }[]>`
+            SELECT "credential_id" FROM "webauthn_credentials"
+            WHERE "credential_id" = ${credentialId}
+            LIMIT 1
+        `
+
+        if (existing.length > 0) {
+            throw new Error('Credential already registered')
+        }
+
         await getPrisma().$executeRaw`
-            INSERT INTO "webauthn_credentials" ("user_id", "credential_id", "public_key")
-            VALUES (${userId}, ${credentialId}, ${publicKey})
-            ON CONFLICT ("credential_id") DO UPDATE SET
-                "public_key" = EXCLUDED."public_key",
-                "updated_at" = CURRENT_TIMESTAMP,
-                "last_used_at" = CURRENT_TIMESTAMP
+            INSERT INTO "webauthn_credentials" ("user_id", "credential_id", "public_key", "counter")
+            VALUES (${userId}, ${credentialId}, ${publicKey}, 0)
         `
 
         return { userId, credentialId, publicKey }
+    }
+
+    static async verifyWebAuthnAssertion(credentialId: string, newCounter: number) {
+        const rows = await getPrisma().$queryRaw<{ counter: number }[]>`
+            SELECT "counter" FROM "webauthn_credentials"
+            WHERE "credential_id" = ${credentialId}
+            LIMIT 1
+        `
+
+        if (rows.length === 0) {
+            throw new Error('Credential not found')
+        }
+
+        const storedCounter = rows[0].counter
+
+        if (newCounter <= storedCounter) {
+            throw new Error('Counter regression detected: possible cloned authenticator')
+        }
+
+        await getPrisma().$executeRaw`
+            UPDATE "webauthn_credentials"
+            SET "counter" = ${newCounter}, "last_used_at" = CURRENT_TIMESTAMP
+            WHERE "credential_id" = ${credentialId}
+        `
+
+        return { credentialId, counter: newCounter }
     }
 }
 
