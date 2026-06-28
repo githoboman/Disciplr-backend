@@ -33,3 +33,16 @@ Whenever a vault is created, updated, or cancelled in [vaultStore.ts](file:///c:
 ### 2. Analytics Refresh
 Whenever the analytics summary is updated or refreshed in [analytics.service.ts](file:///c:/Users/HP/Disciplr-backend/src/services/analytics.service.ts):
 *   `invalidate('analytics:overall', orgId)`: Evicts overall namespaced analytics.
+
+## Performance Benchmark
+
+The cache-aside layer is covered by a dedicated benchmark that measures hit ratio
+and read latency for the vault and analytics read paths. The benchmark uses the
+in-memory LRU implementation (no Redis) so measurements are fully deterministic.
+
+Key thresholds enforced:
+*   **Hit ratio** ≥ 95 % after a single warm-up miss
+*   **p95 in-memory hit latency** < 5 ms
+
+See [performance-testing.md — Cache Read Benchmark](performance-testing.md#cache-read-benchmark)
+for the full coverage table, budget constants, and instructions for running the suite.
