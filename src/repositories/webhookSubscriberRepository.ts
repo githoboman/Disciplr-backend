@@ -1,6 +1,7 @@
 import { Knex } from 'knex'
 import type { WebhookSubscriber, BreakerState, BreakerStateValue } from '../services/webhooks.js'
 import { FieldPolicy, parseFieldPolicy, DEFAULT_FIELD_POLICY } from '../utils/webhookFieldMasking.js'
+import { encryptField, decryptField, isEncrypted } from '../lib/encryption.js'
 
 interface SubscriberRow {
   id: string
@@ -39,13 +40,29 @@ interface BreakerRow {
   updated_at: Date
 }
 
+/**
+ * Decrypts a stored secret column for in-memory use.
+ *
+ * Signing secrets are encrypted at rest (AES-256-GCM). During the rollout
+ * window a column may still hold a legacy plaintext value written before this
+ * feature existed; such values are passed through unchanged and will be
+ * re-encrypted on their next write. Anything that *looks* encrypted is
+ * decrypted strictly — a failure throws rather than leaking ciphertext as if it
+ * were the secret.
+ */
+function decryptSecretColumn(value: string | null): string | null {
+  if (value === null) return null
+  return isEncrypted(value) ? decryptField(value) : value
+}
+
 function toSubscriber(row: SubscriberRow): WebhookSubscriber {
   return {
     id: row.id,
     organizationId: row.organization_id,
     url: row.url,
-    secret: row.secret,
-    previousSecret: row.previous_secret ?? null,
+    // Decrypted only here, in memory, at read time.
+    secret: decryptSecretColumn(row.secret)!,
+    previousSecret: decryptSecretColumn(row.previous_secret),
     rotatedAt: row.rotated_at instanceof Date
       ? row.rotated_at.toISOString()
       : (row.rotated_at ? String(row.rotated_at) : null),
@@ -121,7 +138,7 @@ export class WebhookSubscriberRepository {
       .insert({
         organization_id: data.organizationId,
         url: data.url,
-        secret: data.secret,
+        secret: encryptField(data.secret),
         events: JSON.stringify(data.events) as any,
         schema_version: data.schemaVersion ?? 1,
         field_policy: JSON.stringify(data.fieldPolicy ?? DEFAULT_FIELD_POLICY) as any,
@@ -169,7 +186,7 @@ export class WebhookSubscriberRepository {
         {
           organizationId: data.organizationId,
           url: data.url,
-          secret: data.secret,
+          secret: encryptField(data.secret),
           events: JSON.stringify(data.events),
           fieldPolicy: fieldPolicyJson,
         },
@@ -219,8 +236,10 @@ export class WebhookSubscriberRepository {
     const rows = await this.db<SubscriberRow>('webhook_subscribers')
       .where({ id, organization_id: organizationId })
       .update({
+        // The current (already-encrypted) secret column is copied verbatim into
+        // previous_secret — it stays ciphertext, no re-encryption needed.
         previous_secret: this.db.raw('secret'),
-        secret: newSecret,
+        secret: encryptField(newSecret),
         rotated_at: this.db.fn.now(),
         updated_at: this.db.fn.now(),
       })

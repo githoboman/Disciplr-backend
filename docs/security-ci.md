@@ -42,6 +42,13 @@ To ensure consistent builds and prevent malicious dependency injection during th
 - **Secrets Management:** Sensitive tokens or keys are never logged in CI output.
 - **Actionable Output:** Security reports are generated in JSON format for potential integration with external monitoring tools.
 
+## Encryption at Rest
+
+Reversible secrets that cannot be hashed (e.g. webhook HMAC signing secrets) are
+encrypted at rest with AES-256-GCM and a rotatable, key-id-tagged key. See
+[field-encryption.md](./field-encryption.md) for the scheme and the key-rotation
+runbook.
+
 ## Best Practices for Developers
 
 - Always run `npm audit` locally before committing dependency changes.
