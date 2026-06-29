@@ -538,3 +538,15 @@ Whitespace is collapsed and the fingerprint is capped at 200 characters.
 ### Memory Footprint
 
 Each entry holds a fingerprint string (≤200 chars), a number, and an ISO timestamp string. At the default buffer size of 100 entries this is well under 100 KB.
+
+## HTTP Performance Metrics (RED)
+
+### `http_requests_total`
+* **Type**: Counter
+* **Description**: Total number of inbound HTTP requests.
+* **Labels**: `method`, `route`, `status_class`
+
+### `http_request_duration_seconds`
+* **Type**: Histogram
+* **Description**: Latency distribution tracking for processed HTTP requests in seconds.
+* **Labels**: `method`, `route`, `status_class`

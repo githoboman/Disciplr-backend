@@ -1,3 +1,4 @@
+import { httpMetricsMiddleware } from './observability/httpMetrics.js';
 import cors from 'cors'
 import express from 'express'
 import helmet from 'helmet'
@@ -9,6 +10,7 @@ import { adminRouter } from './routes/admin.js'
 import { notificationsRouter } from './routes/notifications.js'
 
 export const app = express()
+app.use(httpMetricsMiddleware);
 
 // ---------------------------------------------------------------------------
 // Helmet — API-only hardened configuration
