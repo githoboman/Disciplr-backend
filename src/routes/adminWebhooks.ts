@@ -4,6 +4,8 @@ import { requireAdmin } from '../middleware/rbac.js'
 import { UserRole } from '../types/user.js'
 import { createAuditLog } from '../lib/audit-logs.js'
 import { db } from '../db/knex.js'
+import { replayForVault } from '../services/outboxRelay.js'
+import { strictRateLimiter } from '../middleware/rateLimiter.js'
 import {
   replayDeadLetter,
   upsertSubscriber,
@@ -421,3 +423,40 @@ adminWebhooksRouter.patch(
     }
   },
 )
+
+export const adminVaultReplayRouter = Router()
+
+adminVaultReplayRouter.use(authenticate)
+adminVaultReplayRouter.use(requireAdmin)
+adminVaultReplayRouter.use(strictRateLimiter)
+
+adminVaultReplayRouter.post('/:id/replay-events', async (req: Request, res: Response) => {
+  try {
+    const vaultId = req.params.id
+    const { subscriber_id } = req.body ?? {}
+
+    if (subscriber_id && typeof subscriber_id !== 'string') {
+      res.status(400).json({ error: 'subscriber_id must be a string' })
+      return
+    }
+
+    const replayedCount = await replayForVault(vaultId, subscriber_id)
+
+    createAuditLog({
+      actor_user_id: req.user!.userId,
+      action: 'vault.outbox.replay',
+      target_type: 'vault',
+      target_id: vaultId,
+      metadata: {
+        subscriberId: subscriber_id,
+        replayedCount,
+      },
+    })
+
+    res.status(200).json({ replayed: true, count: replayedCount })
+  } catch (error) {
+    console.error('Error replaying vault outbox events:', error)
+    res.status(500).json({ error: 'Failed to replay vault events' })
+  }
+})
+

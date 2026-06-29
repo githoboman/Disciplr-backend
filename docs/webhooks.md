@@ -243,6 +243,25 @@ await addSubscriber({
 })
 ```
 
+#### POST `/api/admin/vaults/:id/replay-events`
+
+Replays all recorded outbox lifecycle events for a single vault to an optional target subscriber. Preserves original event ordering and event IDs/idempotency keys.
+
+Request Body (Optional):
+```json
+{
+  "subscriber_id": "90b1e428-2f19-4b2b-8a71-3cb56667104b"
+}
+```
+
+Response (200):
+```json
+{
+  "replayed": true,
+  "count": 3
+}
+```
+
 ## Test-Ping Endpoint
 
 `POST /api/webhooks/:id/test` lets subscribers self-verify their delivery URL and HMAC wiring before real vault events start flowing.
