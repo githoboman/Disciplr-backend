@@ -3,6 +3,7 @@ import { isIP } from 'node:net'
 import { WebhookSubscriberRepository } from '../repositories/webhookSubscriberRepository.js'
 import { retryWithBackoff } from '../utils/retry.js'
 import { db } from '../db/index.js'
+import { applyFieldMasking, FieldPolicy, DEFAULT_FIELD_POLICY, parseFieldPolicy } from '../utils/webhookFieldMasking.js'
 
 export interface WebhookDeadLetter {
   id: string
@@ -37,6 +38,11 @@ export interface WebhookSubscriber {
   active: boolean
   createdAt: string
   schemaVersion: number
+  /**
+   * Per-subscriber field masking policy. Controls which fields are included
+   * in webhook payloads and whether PII is stripped. Applied before signing.
+   */
+  fieldPolicy: FieldPolicy
 }
 
 export const LATEST_SCHEMA_VERSION = 2
@@ -86,6 +92,10 @@ export interface CircuitBreakerConfig {
  * Builds the HTTP request body for a webhook delivery according to the
  * subscriber's preferred schema version.
  *
+ * Field masking is applied BEFORE serialization, so the signature is computed
+ * on the masked payload. This ensures subscribers can verify the signature
+ * even when fields are filtered or PII is stripped.
+ *
  * v1 – Original shape with schema_version appended:
  *   { eventId, eventType, timestamp, data, organizationId, schema_version: 1 }
  *
@@ -96,13 +106,17 @@ export const buildVersionedPayload = (
   subscriber: WebhookSubscriber,
   payload: WebhookDeliveryPayload,
 ): string => {
+  // Apply field masking policy to the data before serialization
+  const fieldPolicy = subscriber.fieldPolicy ?? DEFAULT_FIELD_POLICY
+  const maskedData = applyFieldMasking(payload.data, fieldPolicy)
+
   switch (subscriber.schemaVersion) {
     case 1:
       return JSON.stringify({
         eventId: payload.eventId,
         eventType: payload.eventType,
         timestamp: payload.timestamp,
-        data: payload.data,
+        data: maskedData,
         organizationId: payload.organizationId,
         schema_version: 1,
       })
@@ -110,7 +124,7 @@ export const buildVersionedPayload = (
       return JSON.stringify({
         schema_version: 2,
         event_type: payload.eventType,
-        data: payload.data,
+        data: maskedData,
       })
     default:
       throw new Error(
@@ -430,6 +444,101 @@ export const verifySignatureWithGrace = (
   return false
 }
 
+// ── Egress allowlist ──────────────────────────────────────────────────────────
+
+export interface EgressAllowlistEntry {
+  id: string
+  organizationId: string
+  host: string
+  createdAt: string
+}
+
+/**
+ * Returns the per-org egress allowlist hosts for an organization.
+ * Empty array means no allowlist is configured (baseline SSRF guard only).
+ */
+export const getEgressAllowlist = async (organizationId: string): Promise<string[]> => {
+  const rows = await db('org_webhook_egress_allowlists')
+    .where({ organization_id: organizationId })
+    .select('host')
+  return rows.map((r: { host: string }) => r.host)
+}
+
+/**
+ * Adds a host to an org's egress allowlist. Idempotent — duplicate host is ignored.
+ */
+export const addEgressAllowlistEntry = async (
+  organizationId: string,
+  host: string,
+): Promise<EgressAllowlistEntry> => {
+  const [row] = await db('org_webhook_egress_allowlists')
+    .insert({ organization_id: organizationId, host: host.toLowerCase() })
+    .onConflict(['organization_id', 'host'])
+    .merge({ host: host.toLowerCase() })
+    .returning('*')
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    host: row.host,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+  }
+}
+
+/**
+ * Removes a host from an org's egress allowlist.
+ * Returns true if a row was deleted.
+ */
+export const removeEgressAllowlistEntry = async (
+  organizationId: string,
+  host: string,
+): Promise<boolean> => {
+  const count = await db('org_webhook_egress_allowlists')
+    .where({ organization_id: organizationId, host: host.toLowerCase() })
+    .del()
+  return count > 0
+}
+
+/**
+ * Lists all egress allowlist entries for an organization.
+ */
+export const listEgressAllowlist = async (
+  organizationId: string,
+): Promise<EgressAllowlistEntry[]> => {
+  const rows = await db('org_webhook_egress_allowlists')
+    .where({ organization_id: organizationId })
+    .orderBy('created_at', 'asc')
+  return rows.map((row: any) => ({
+    id: row.id,
+    organizationId: row.organization_id,
+    host: row.host,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+  }))
+}
+
+/**
+ * Checks whether a URL is permitted for the given organization, respecting:
+ * 1. The global SSRF guard (unconditional baseline).
+ * 2. The per-org egress allowlist, when configured (deny by policy if not on it).
+ *
+ * When the org has no allowlist entries the SSRF guard alone governs.
+ */
+export const isUrlAllowedForOrg = async (
+  organizationId: string,
+  url: string,
+): Promise<{ allowed: boolean; reason?: string }> => {
+  if (!isUrlAllowed(url)) {
+    return { allowed: false, reason: `Webhook URL not permitted: ${url}` }
+  }
+  const orgHosts = await getEgressAllowlist(organizationId)
+  if (orgHosts.length === 0) {
+    return { allowed: true }
+  }
+  if (!isUrlAllowed(url, orgHosts)) {
+    return { allowed: false, reason: `Webhook URL not on egress allowlist for org: ${url}` }
+  }
+  return { allowed: true }
+}
+
 export const addSubscriber = async (
   organizationId: string,
   url: string,
@@ -437,8 +546,9 @@ export const addSubscriber = async (
   events: string[],
   schemaVersion: number = DEFAULT_SCHEMA_VERSION,
 ): Promise<WebhookSubscriber> => {
-  if (!isUrlAllowed(url)) {
-    throw new Error(`Webhook URL not permitted: ${url}`)
+  const check = await isUrlAllowedForOrg(organizationId, url)
+  if (!check.allowed) {
+    throw new Error(check.reason!)
   }
 
   const unknownEvent = events.find((e) => !KNOWN_EVENT_TYPES.has(e))
@@ -482,8 +592,9 @@ export const upsertSubscriber = async (
   secret: string,
   events: string[],
 ): Promise<WebhookSubscriber> => {
-  if (!isUrlAllowed(url)) {
-    throw new Error(`Webhook URL not permitted: ${url}`)
+  const check = await isUrlAllowedForOrg(organizationId, url)
+  if (!check.allowed) {
+    throw new Error(check.reason!)
   }
 
   return repo.upsert({ organizationId, url, secret, events })
@@ -533,6 +644,18 @@ export const isPreviousSecretInGrace = (subscriber: WebhookSubscriber): boolean 
 
 export const listSubscribers = async (organizationId: string): Promise<WebhookSubscriber[]> =>
   repo.findByOrg(organizationId)
+
+/**
+ * Updates the field masking policy for a subscriber.
+ * Returns null when the subscriber does not exist or belongs to a different org.
+ */
+export const updateSubscriberFieldPolicy = async (
+  id: string,
+  organizationId: string,
+  fieldPolicy: FieldPolicy,
+): Promise<WebhookSubscriber | null> => {
+  return repo.updateFieldPolicy(id, organizationId, fieldPolicy)
+}
 
 /** Test helper – clears all subscribers from the database. */
 export const resetSubscribers = async (): Promise<void> => {
@@ -594,10 +717,25 @@ export const dispatchWebhookEvent = async (
   const eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
   const config = getCircuitBreakerConfig()
 
+  // Load org allowlist once for the whole dispatch batch (defense in depth)
+  const orgAllowlistHosts = await getEgressAllowlist(payload.organizationId)
+
   return Promise.all(
     eligible.map(async (subscriber): Promise<WebhookDeliveryResult> => {
       let attempts = 0
       let lastStatusCode: number | undefined
+
+      // ── Egress allowlist check (delivery-time enforcement) ─────────────────
+      if (!isUrlAllowed(subscriber.url)) {
+        const reason = `Webhook URL not permitted: ${subscriber.url}`
+        await deadLetter(subscriber.id, payload, reason, 0)
+        return { subscriberId: subscriber.id, url: subscriber.url, success: false, error: reason, attempts: 0 }
+      }
+      if (orgAllowlistHosts.length > 0 && !isUrlAllowed(subscriber.url, orgAllowlistHosts)) {
+        const reason = `Webhook URL not on egress allowlist for org: ${subscriber.url}`
+        await deadLetter(subscriber.id, payload, reason, 0)
+        return { subscriberId: subscriber.id, url: subscriber.url, success: false, error: reason, attempts: 0 }
+      }
 
       // ── Circuit breaker check ──────────────────────────────
       const breaker = await checkBreaker(subscriber.id, config)
@@ -704,8 +842,9 @@ export const replayDeadLetter = async (
     return { replayed: false, error: 'Subscriber not registered' }
   }
 
-  if (!isUrlAllowed(subscriber.url)) {
-    return { replayed: false, error: 'URL no longer allowed' }
+  const check = await isUrlAllowedForOrg(subscriber.organizationId, subscriber.url)
+  if (!check.allowed) {
+    return { replayed: false, error: check.reason! }
   }
 
   try {

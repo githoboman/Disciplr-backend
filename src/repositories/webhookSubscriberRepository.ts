@@ -1,5 +1,6 @@
 import { Knex } from 'knex'
 import type { WebhookSubscriber, BreakerState, BreakerStateValue } from '../services/webhooks.js'
+import { FieldPolicy, parseFieldPolicy, DEFAULT_FIELD_POLICY } from '../utils/webhookFieldMasking.js'
 
 interface SubscriberRow {
   id: string
@@ -11,6 +12,7 @@ interface SubscriberRow {
   events: string[]
   active: boolean
   schema_version: number
+  field_policy: unknown
   created_at: Date
   updated_at: Date
 }
@@ -50,6 +52,7 @@ function toSubscriber(row: SubscriberRow): WebhookSubscriber {
     events: row.events ?? [],
     active: row.active,
     schemaVersion: row.schema_version ?? 1,
+    fieldPolicy: parseFieldPolicy(row.field_policy),
     createdAt: row.created_at instanceof Date
       ? row.created_at.toISOString()
       : String(row.created_at),
@@ -112,6 +115,7 @@ export class WebhookSubscriberRepository {
     secret: string
     events: string[]
     schemaVersion?: number
+    fieldPolicy?: FieldPolicy
   }): Promise<WebhookSubscriber> {
     const [row] = await this.db<SubscriberRow>('webhook_subscribers')
       .insert({
@@ -120,6 +124,7 @@ export class WebhookSubscriberRepository {
         secret: data.secret,
         events: JSON.stringify(data.events) as any,
         schema_version: data.schemaVersion ?? 1,
+        field_policy: JSON.stringify(data.fieldPolicy ?? DEFAULT_FIELD_POLICY) as any,
       })
       .returning('*')
     return toSubscriber(row)
@@ -143,18 +148,21 @@ export class WebhookSubscriberRepository {
     url: string
     secret: string
     events: string[]
+    fieldPolicy?: FieldPolicy
   }): Promise<WebhookSubscriber> {
+    const fieldPolicyJson = JSON.stringify(data.fieldPolicy ?? DEFAULT_FIELD_POLICY)
     const [row] = await this.db
       .raw<{ rows: SubscriberRow[] }>(
         `
-        INSERT INTO webhook_subscribers (organization_id, url, secret, events, active)
-        VALUES (:organizationId, :url, :secret, :events::jsonb, true)
+        INSERT INTO webhook_subscribers (organization_id, url, secret, events, active, field_policy)
+        VALUES (:organizationId, :url, :secret, :events::jsonb, true, :fieldPolicy::jsonb)
         ON CONFLICT (organization_id, url)
         DO UPDATE SET
-          secret     = EXCLUDED.secret,
-          events     = EXCLUDED.events,
-          active     = true,
-          updated_at = now()
+          secret       = EXCLUDED.secret,
+          events       = EXCLUDED.events,
+          field_policy = EXCLUDED.field_policy,
+          active       = true,
+          updated_at   = now()
         WHERE webhook_subscribers.organization_id = :organizationId
         RETURNING *
         `,
@@ -163,11 +171,33 @@ export class WebhookSubscriberRepository {
           url: data.url,
           secret: data.secret,
           events: JSON.stringify(data.events),
+          fieldPolicy: fieldPolicyJson,
         },
       )
       .then((result) => result.rows)
 
     return toSubscriber(row)
+  }
+
+  /**
+   * Updates the field policy for a subscriber.
+   * Returns null if the subscriber does not exist or belongs to a different org.
+   */
+  async updateFieldPolicy(
+    id: string,
+    organizationId: string,
+    fieldPolicy: FieldPolicy,
+  ): Promise<WebhookSubscriber | null> {
+    const rows = await this.db<SubscriberRow>('webhook_subscribers')
+      .where({ id, organization_id: organizationId })
+      .update({
+        field_policy: JSON.stringify(fieldPolicy) as any,
+        updated_at: this.db.fn.now(),
+      })
+      .returning('*')
+
+    if (rows.length === 0) return null
+    return toSubscriber(rows[0])
   }
 
   /**

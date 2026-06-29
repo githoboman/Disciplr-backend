@@ -124,11 +124,88 @@ Response (404):
 { "error": "Dead letter not found or already replayed" }
 ```
 
+## Test-Ping Endpoint
+
+`POST /api/webhooks/:id/test` lets subscribers self-verify their delivery URL and HMAC wiring before real vault events start flowing.
+
+### Authorization
+
+- Caller must be authenticated (Bearer JWT).
+- The subscriber must belong to the caller's organization (`enterpriseId` in the JWT must match `organizationId` on the subscriber). Cross-org pings return **403**.
+
+### Rate Limiting
+
+5 requests per subscriber per 60 seconds to prevent abuse as an SSRF probe.
+
+### Request
+
+```http
+POST /api/webhooks/{subscriberId}/test
+Authorization: Bearer <token>
+```
+
+No request body required.
+
+### Response (200 — always returned for delivery attempts)
+
+```json
+{
+  "delivered": true,
+  "statusCode": 200,
+  "latencyMs": 142,
+  "signatureHeader": "sha256=<hex-digest>"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `delivered` | boolean | `true` if the subscriber returned 2xx |
+| `statusCode` | number | HTTP status returned by the subscriber (present on delivery attempts) |
+| `latencyMs` | number | Round-trip time in milliseconds |
+| `signatureHeader` | string | The `x-disciplr-signature` value that was sent — use this to verify your HMAC code |
+| `error` | string | Error description when `delivered: false` |
+
+The subscriber's **secret is never returned** in the response. Use `signatureHeader` to confirm your HMAC implementation produces the same digest from the request body.
+
+### Synthetic Payload
+
+The test event uses the same versioned envelope (`buildVersionedPayload`) as real deliveries, so a passing test guarantees real deliveries will also verify. The event type is `webhook.test`.
+
+Example v1 body:
+```json
+{
+  "eventId": "test:<uuid>",
+  "eventType": "webhook.test",
+  "timestamp": "2026-06-28T00:00:00.000Z",
+  "data": { "message": "This is a test delivery from Disciplr…" },
+  "organizationId": "<your-org-id>",
+  "schema_version": 1
+}
+```
+
+### Error Cases
+
+| HTTP Status | Condition |
+|-------------|-----------|
+| 401 | Missing or invalid Bearer token |
+| 403 | Subscriber belongs to a different organization |
+| 404 | Subscriber not found |
+| 422 | Subscriber URL is blocked by the SSRF guard |
+| 429 | Rate limit exceeded (5 pings/subscriber/minute) |
+| 200 + `delivered: false` | Subscriber URL returned an error, timed out, or refused a redirect |
+
+---
+
 ## Testing
 
 Run webhook tests:
 ```bash
 npm test -- --testPathPattern=webhooks
+```
+
+Run the test-ping tests specifically:
+```bash
+npm test -- src/tests/webhooks.testPing.test.ts
 ```
 
 DLQ tests require a PostgreSQL database (`DATABASE_URL`). Without it, they are skipped gracefully.
@@ -154,6 +231,7 @@ Webhook subscribers are stored in the `webhook_subscribers` table:
 | `events` | `jsonb` | Array of event types to receive; empty array = wildcard (all events) |
 | `active` | `boolean` | Whether the subscriber is active |
 | `schema_version` | `integer` (default `1`) | Payload schema version (see Payload Schema Versioning) |
+| `field_policy` | `jsonb` | Field masking policy (see Field Masking & PII Stripping) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last update timestamp |
 
@@ -356,6 +434,166 @@ await addSubscriber(orgId, url, secret, events, 2)
 
 ---
 
+## Field Masking & PII Stripping
+
+Each webhook subscriber can have a configurable **field policy** that controls which fields appear in delivered payloads and whether PII is stripped. Field masking is applied **before** the HMAC signature is computed, ensuring subscribers can verify the signature on the masked payload.
+
+### Field Policy Schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `'default' \| 'allowlist' \| 'denylist'` | `'default'` | How to filter fields |
+| `fields` | `string[]` | `[]` | Field paths to include/exclude (depending on mode) |
+| `stripPii` | `boolean` | `true` | Whether to apply PII masking |
+
+### Policy Modes
+
+| Mode | Behavior |
+|------|----------|
+| **default** | All fields are included. If `stripPii` is true, known PII fields are masked. |
+| **allowlist** | Only fields listed in `fields` are included. All other fields are omitted. |
+| **denylist** | All fields except those listed in `fields` are included. |
+
+### Field Path Syntax
+
+Field paths use dot notation for nested fields:
+- `vaultId` - Top-level field
+- `vault.name` - Nested field
+- `vault.*` - Wildcard: matches all fields under `vault`
+
+### PII Stripping
+
+When `stripPii` is `true` (the default), the following fields are automatically masked using a deterministic SHA-256 hash (first 8 hex characters):
+
+- `creator`
+- `creatoraddress`
+- `email`
+- `failuredestination`
+- `requesteruserid`
+- `successdestination`
+- `targetuserid`
+- `userid`
+
+Additionally, email addresses and Stellar account IDs found anywhere in string values are masked.
+
+### Examples
+
+#### Default Policy (PII Stripping Enabled)
+
+```json
+{
+  "mode": "default",
+  "fields": [],
+  "stripPii": true
+}
+```
+
+Input:
+```json
+{
+  "vaultId": "123",
+  "creator": "user@example.com",
+  "amount": 1000
+}
+```
+
+Output:
+```json
+{
+  "vaultId": "123",
+  "creator": "a4d8f3c2",
+  "amount": 1000
+}
+```
+
+#### Allowlist Mode
+
+```json
+{
+  "mode": "allowlist",
+  "fields": ["vaultId", "amount"],
+  "stripPii": false
+}
+```
+
+Input:
+```json
+{
+  "vaultId": "123",
+  "creator": "user@example.com",
+  "amount": 1000,
+  "secret": "sensitive"
+}
+```
+
+Output:
+```json
+{
+  "vaultId": "123",
+  "amount": 1000
+}
+```
+
+#### Denylist Mode
+
+```json
+{
+  "mode": "denylist",
+  "fields": ["internalId", "debugInfo.*"],
+  "stripPii": true
+}
+```
+
+### Admin API
+
+#### `PATCH /api/admin/webhooks/subscribers/:id/field-policy`
+
+Updates the field policy for a subscriber.
+
+**Body:**
+```json
+{
+  "organization_id": "org-123",
+  "field_policy": {
+    "mode": "allowlist",
+    "fields": ["vaultId", "status", "amount"],
+    "stripPii": true
+  }
+}
+```
+
+**Response 200:**
+```json
+{
+  "id": "uuid",
+  "field_policy": {
+    "mode": "allowlist",
+    "fields": ["vaultId", "status", "amount"],
+    "stripPii": true
+  }
+}
+```
+
+### Database Schema
+
+The `webhook_subscribers` table includes a `field_policy` JSONB column:
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| `field_policy` | `jsonb` | `{"mode": "default", "fields": [], "stripPii": true}` | Per-subscriber field masking configuration |
+
+### Signature Implications
+
+The HMAC signature is computed **after** field masking is applied. This means:
+
+1. Different subscribers may receive different payloads for the same event (based on their field policies).
+2. Each subscriber's signature is computed over their specific masked payload.
+3. Subscribers can verify the signature using the masked payload they receive.
+
+This design ensures that the signature always matches the delivered body, regardless of masking configuration.
+
+---
+
 ## Outbound Webhooks
 The Disciplr backend dispatches webhooks to subscribers when specific events occur. Subscribers can register to receive webhook deliveries for events such as `vault_created`, `vault_completed`, etc.
 
@@ -396,3 +634,83 @@ const signatureString = `${timestamp}.${nonce}.${rawBody}`;
 const digest = crypto.createHmac('sha256', secret).update(signatureString).digest('hex');
 const signatureHeader = `sha256=${digest}`;
 ```
+
+## Per-Organization Egress Allowlist
+
+In addition to the global SSRF guard, operators can configure a per-org allowlist of permitted destination hosts. When at least one entry exists for an organization, webhook delivery is restricted to URLs whose hostname matches an allowlist entry (exact match or subdomain).
+
+### Behaviour
+
+| Org allowlist state | URL passes SSRF guard | Result |
+|---|---|---|
+| Empty (not configured) | ✓ | Delivery allowed (baseline SSRF guard only) |
+| Non-empty | ✓, host on allowlist | Delivery allowed |
+| Non-empty | ✓, host **not** on allowlist | Delivery denied — goes to dead-letter queue |
+| Any | ✗ (private IP, loopback, etc.) | Delivery denied (unconditional baseline) |
+
+The SSRF guard is always applied first, regardless of allowlist configuration. An allowlist entry for a private address cannot bypass the SSRF guard.
+
+Enforcement is applied at **two points**:
+
+1. **Subscriber registration** (`addSubscriber` / `upsertSubscriber`) — the URL is validated at creation time.
+2. **Delivery time** (`dispatchWebhookEvent` / `replayDeadLetter`) — the subscriber's URL is re-checked before each delivery attempt. A host removed from the allowlist after registration stops receiving events immediately.
+
+### Subdomain matching
+
+An entry of `example.com` permits both `hooks.example.com` and `api.hooks.example.com` (any subdomain at any depth). An entry of `hooks.example.com` only permits that host and its subdomains, not `example.com` itself.
+
+### Admin API
+
+All allowlist endpoints require admin authentication.
+
+#### List entries
+
+```
+GET /api/admin/webhooks/egress-allowlist?organization_id=<org>
+```
+
+Response:
+```json
+{
+  "egress_allowlist": [
+    { "id": "uuid", "organizationId": "org-1", "host": "hooks.example.com", "createdAt": "..." }
+  ]
+}
+```
+
+#### Add entry
+
+```
+POST /api/admin/webhooks/egress-allowlist
+Content-Type: application/json
+
+{ "organization_id": "org-1", "host": "hooks.example.com" }
+```
+
+Idempotent — posting a host that already exists returns the existing entry with `201`.
+
+#### Remove entry
+
+```
+DELETE /api/admin/webhooks/egress-allowlist
+Content-Type: application/json
+
+{ "organization_id": "org-1", "host": "hooks.example.com" }
+```
+
+Returns `404` if the entry does not exist.
+
+> **Warning**: removing the last entry for an org leaves the allowlist empty, which **removes the policy restriction** (baseline SSRF guard only). To block all delivery for an org, deactivate subscribers instead.
+
+### Database
+
+Allowlist entries are persisted in `org_webhook_egress_allowlists`:
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `organization_id` | VARCHAR(255) | Owning organization |
+| `host` | VARCHAR(253) | Permitted hostname (stored lowercase) |
+| `created_at` | TIMESTAMPTZ | Row creation time |
+
+A unique constraint on `(organization_id, host)` prevents duplicate entries.

@@ -91,6 +91,8 @@ export class EventProcessor {
           ledger_number: event.ledgerNumber,
           processing_duration_ms: processingDurationMs
         }
+      }).catch((err) => {
+        console.error('[EventProcessor] audit log write failed (event_processed):', err)
       })
 
 
@@ -114,6 +116,8 @@ export class EventProcessor {
           error_message: errorMessage,
           retryable
         }
+      }).catch((err) => {
+        console.error('[EventProcessor] audit log write failed (event_processing_failed):', err)
       })
 
       if (retryable) {

@@ -23,6 +23,7 @@ import { adminWebhooksRouter } from './routes/adminWebhooks.js'
 import { verificationsRouter } from './routes/verifications.js'
 import { apiKeysRouter } from './routes/apiKeys.js'
 import { notificationsRouter } from './routes/notifications.js'
+import { notificationPreferencesRouter } from './routes/notificationPreferences.js'
 import { webhooksRouter } from './routes/webhooks.js'
 import { graphqlRouter } from './routes/graphql.js'
 import { createNotificationService, NotificationService } from './services/notifications/factory.js'
@@ -30,26 +31,30 @@ import { withRequestPrisma } from './middleware/withRequestPrisma.js'
 import {
   securityMetricsMiddleware,
   securityRateLimitMiddleware,
-} from './security/abuse-monitor.js'
-import inFlightMiddleware from './middleware/inFlightRequests.js'
+} from "./security/abuse-monitor.js";
+import inFlightMiddleware from "./middleware/inFlightRequests.js";
 
 type BootstrapOptions = {
-  notificationService?: NotificationService
-  notificationProviderName?: string
-}
+  notificationService?: NotificationService;
+  notificationProviderName?: string;
+};
 
 export function bootstrapApp(options: BootstrapOptions = {}) {
   const notificationService =
     options.notificationService ??
-    createNotificationService(options.notificationProviderName ?? process.env.NOTIFICATION_PROVIDER ?? 'console')
-  const jobSystem = new BackgroundJobSystem(notificationService)
-  configureExportJobRepository(createKnexExportJobRepository(db))
+    createNotificationService(
+      options.notificationProviderName ??
+        process.env.NOTIFICATION_PROVIDER ??
+        "console",
+    );
+  const jobSystem = new BackgroundJobSystem(notificationService);
+  configureExportJobRepository(createKnexExportJobRepository(db));
 
-  app.use(securityMetricsMiddleware)
-  app.use(securityRateLimitMiddleware)
+  app.use(securityMetricsMiddleware);
+  app.use(securityRateLimitMiddleware);
   // Track in-flight requests for graceful shutdown
-  app.use(inFlightMiddleware)
-  app.use(withRequestPrisma)
+  app.use(inFlightMiddleware);
+  app.use(withRequestPrisma);
 
   app.use('/api/health', healthRateLimiter, createHealthRouter(jobSystem, privacyAbuseMonitor))
   app.use('/api/jobs', createJobsRouter(jobSystem))
@@ -64,6 +69,7 @@ export function bootstrapApp(options: BootstrapOptions = {}) {
   app.use('/api/organizations', orgAnalyticsRouter)
   app.use('/api/organizations', orgMembersRouter)
   app.use('/api/orgs', orgMembersRouter)
+  app.use('/api/orgs', notificationPreferencesRouter)
   app.use('/api/organizations/:orgId/graphql', graphqlRouter)
   app.use('/api/admin', adminRouter)
   app.use('/api/admin/verifiers', adminVerifiersRouter)
@@ -71,11 +77,12 @@ export function bootstrapApp(options: BootstrapOptions = {}) {
   app.use('/api/verifications', verificationsRouter)
   app.use('/api/api-keys', apiKeysRouter)
   app.use('/api/notifications', notificationsRouter)
+  app.use('/api/users/me/notification-preferences', notificationPreferencesRouter)
   app.use('/api/webhooks', webhooksRouter)
 
   // Catch-all 404 and uniform error shape – must be registered after all routes.
-  app.use(notFound)
-  app.use(errorHandler)
+  app.use(notFound);
+  app.use(errorHandler);
 
-  return { app, jobSystem }
+  return { app, jobSystem };
 }

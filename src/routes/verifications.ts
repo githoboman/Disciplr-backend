@@ -7,6 +7,15 @@ import { AppError } from '../middleware/errorHandler.js'
 import { createEvidenceReference, EvidenceReferenceValidationError } from '../services/evidence.js'
 import { db } from '../db/knex.js'
 import { retryWithBackoff } from '../utils/retry.js'
+import {
+  getIdempotentResponse,
+  hashRequestPayload,
+  saveIdempotentResponse,
+  failPendingIdempotentResponse,
+  IdempotencyConflictError,
+  validateIdempotencyKey,
+  scopeIdempotencyKey,
+} from '../services/idempotency.js'
 
 export const verificationsRouter = Router()
 
@@ -20,6 +29,46 @@ function isSerializationError(err: Error): boolean {
 verificationsRouter.post('/', authenticate, requireVerifier, async (req: Request, res: Response, next: NextFunction) => {
   const payload = req.user!
   const verifierUserId = payload.userId
+
+  const rawIdempotencyKey = req.header('idempotency-key') ?? null
+  let scopedIdempotencyKey: string | null = null
+
+  if (rawIdempotencyKey) {
+    const validation = validateIdempotencyKey(rawIdempotencyKey)
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: {
+          code: validation.code,
+          message: validation.error,
+        },
+      })
+    }
+    scopedIdempotencyKey = scopeIdempotencyKey(verifierUserId, rawIdempotencyKey)
+  }
+
+  const requestHash = hashRequestPayload(req.body)
+
+  if (scopedIdempotencyKey) {
+    try {
+      const cached = await getIdempotentResponse<{ verification: any; evidenceReference: any }>(scopedIdempotencyKey, requestHash)
+      if (cached !== null) {
+        res.status(200).json({ ...cached, idempotency: { key: rawIdempotencyKey, replayed: true } })
+        return
+      }
+    } catch (err) {
+      if (err instanceof IdempotencyConflictError) {
+        res.status(409).json({
+          error: {
+            code: 'IDEMPOTENCY_CONFLICT',
+            message: err.message,
+          },
+        })
+        return
+      }
+      throw err
+    }
+  }
+
   const { targetId, result, disputed, evidenceHash, evidenceReferenceUrl } = req.body as {
     targetId?: string
     result?: 'approved' | 'rejected'
@@ -52,11 +101,6 @@ verificationsRouter.post('/', authenticate, requireVerifier, async (req: Request
   try {
     const cleanTargetId = targetId.trim()
 
-    // Wrap recordVerification + createAuditLog in a single Knex transaction so
-    // a crash between the two writes cannot leave the verification row without
-    // an audit trail.  createEvidenceReference uses Prisma and cannot join the
-    // Knex transaction; it is idempotent (ON CONFLICT DO UPDATE) so it is safe
-    // to call after the Knex tx commits.
     const rec = await retryWithBackoff(
       () =>
         db.transaction(async (trx) => {
@@ -96,8 +140,18 @@ verificationsRouter.post('/', authenticate, requireVerifier, async (req: Request
       evidenceReferenceUrl.trim(),
     )
 
-    res.status(201).json({ verification: rec, evidenceReference })
+    const responseBody: { verification: typeof rec; evidenceReference: typeof evidenceReference; idempotency?: { key: string | null; replayed: boolean } } = { verification: rec, evidenceReference }
+    if (scopedIdempotencyKey) {
+      responseBody.idempotency = { key: rawIdempotencyKey, replayed: false }
+      await saveIdempotentResponse(scopedIdempotencyKey, requestHash, rec.id, responseBody)
+    }
+
+    res.status(201).json(responseBody)
   } catch (error: any) {
+    if (scopedIdempotencyKey) {
+      failPendingIdempotentResponse(scopedIdempotencyKey, requestHash, error)
+    }
+
     if (error?.name === 'VerificationConflictError') {
       return next(AppError.conflict('conflicting verification decision already exists'))
     }
