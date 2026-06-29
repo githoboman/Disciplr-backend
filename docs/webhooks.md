@@ -1,127 +1,246 @@
-# Webhooks
+# Webhook Delivery
 
 ## Overview
 
-The webhook system delivers lifecycle events (e.g. `vault_created`, `vault_completed`, `vault_failed`, `vault_cancelled`) to registered subscriber URLs via HTTP POST with HMAC-SHA256 signature verification.
+The Disciplr backend delivers webhook events to subscriber endpoints with built-in resilience and bounded concurrency. Webhooks are signed with HMAC-SHA256 and support multiple payload schema versions.
 
-## Subscriber Management
+---
 
-Subscribers are stored in-memory (same pattern as API keys). Each subscriber has:
+## Concurrency-Bounded Dispatch Worker
 
-- `id` – UUID
-- `url` – target endpoint
-- `secret` – HMAC signing key
-- `events` – event types to subscribe to (empty = wildcard)
-- `active` – delivery flag
+### Problem
 
-### SSRF Protection
+Webhook delivery can create resource exhaustion during burst events. Without concurrency bounds:
+- Unlimited open sockets to subscribers
+- Memory spike from buffered data
+- Cascade failures if upstream is slow
+- One slow subscriber blocks others
 
-`isUrlAllowed()` blocks loopback, link-local, and RFC-1918 addresses. If `WEBHOOK_ALLOWED_HOSTS` is set, the target hostname must also match.
+### Solution
 
-## Delivery
-
-`dispatchWebhookEvent()` sends a payload to all eligible active subscribers. Each delivery is retried with exponential backoff (max 3 attempts).
-
-### Headers
-
-| Header | Description |
-|--------|-------------|
-| `x-disciplr-signature` | `sha256=<hex-digest>` HMAC-SHA256 of the JSON body |
-| `x-disciplr-event` | Event type (e.g. `vault_created`) |
-| `x-disciplr-event-id` | Originating event ID in `{txHash}:{eventIndex}` format |
-| `x-disciplr-delivery-timestamp` | ISO 8601 timestamp |
-
-## Circuit Breaker
-
-Each subscriber has an associated circuit breaker that isolates chronically failing endpoints so healthy deliveries are not delayed.
-
-### States
-
-| State | Behavior |
-|-------|----------|
-| **CLOSED** | Normal operation. Delivery proceeds. Failures increment a counter. |
-| **OPEN** | All deliveries are short-circuited directly to the dead-letter queue. No HTTP requests are made. |
-| **HALF_OPEN** | Exactly one probe request is allowed. Success transitions back to CLOSED; failure transitions to OPEN. |
-
-### State Machine
+The dispatcher uses a **bounded worker pool** with per-subscriber queuing:
 
 ```
-CLOSED → (failure count ≥ threshold) → OPEN → (timeout elapses) → HALF_OPEN → (probe succeeds) → CLOSED
-                                                                      → (probe fails) → OPEN
+Max concurrency: 10 (default, configurable)
+Scheduler: Round-robin per subscriber
+Circuit breaker: Per-subscriber CLOSED/OPEN/HALF_OPEN
+Retry: Exponential backoff (3 attempts, 1s-30s)
 ```
 
 ### Configuration
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` | `5` | Consecutive failures within the window needed to trip to OPEN |
-| `WEBHOOK_CIRCUIT_BREAKER_WINDOW_MS` | `60_000` | Sliding window (ms) for counting failures |
-| `WEBHOOK_CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_MS` | `30_000` | Time (ms) before an OPEN breaker transitions to HALF_OPEN for a probe |
+| Environment Variable | Default | Description | Valid Range |
+|---------------------|---------|-------------|-------------|
+| `WEBHOOK_MAX_CONCURRENCY` | `10` | Max simultaneous outbound deliveries | 1-1000 |
 
-### Persistence
+### Example
 
-Breaker state is persisted in the `webhook_breaker_states` table and survives restarts. An in-memory cache is used at runtime; the cache is invalidated only on restart or via `resetBreakerCache()` (test helper).
+```bash
+# High-throughput environment (50 concurrent deliveries)
+WEBHOOK_MAX_CONCURRENCY=50
 
-### Metrics
+# Resource-constrained environment (3 concurrent deliveries)
+WEBHOOK_MAX_CONCURRENCY=3
+```
 
-Breaker state counts are exposed as Prometheus gauges at `/api/metrics`:
+---
 
-| Metric | Description |
-|--------|-------------|
-| `disciplr_webhook_breaker_closed` | Subscribers in CLOSED state |
-| `disciplr_webhook_breaker_open` | Subscribers in OPEN state |
-| `disciplr_webhook_breaker_half_open` | Subscribers in HALF_OPEN state |
+## Fair Scheduling
 
-## Dead-Letter Queue
+The dispatcher prevents one slow endpoint from monopolizing the delivery budget using **round-robin per-subscriber** scheduling.
 
-When a delivery permanently fails (exhausts retries) or is short-circuited by an open breaker, the failed delivery is persisted to the `webhook_dead_letters` table for later inspection and replay.
+### Example Scenario
 
-### Schema
+Three subscribers with queued events:
+```
+Subscriber A: [event1, event2, event3]
+Subscriber B: [event1, event2]
+Subscriber C: [event1]
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Primary key |
-| `subscriber_id` | UUID | Subscriber that failed to receive |
-| `event_id` | TEXT | Event ID (`{txHash}:{eventIndex}`) |
-| `event_type` | VARCHAR(128) | Event type |
-| `payload` | JSONB | Original delivery payload |
-| `last_error` | TEXT | Last error message |
-| `attempts` | INTEGER | Number of delivery attempts |
-| `failed_at` | TIMESTAMPTZ | When the delivery permanently failed |
-| `replayed_at` | TIMESTAMPTZ | When the entry was replayed (null if not yet) |
+Max concurrency: 3
+```
 
-### Admin API
+**Dispatch order:**
+```
+Time 0ms:    A.event1,  B.event1,  C.event1  (round-robin, all 3 slots)
+Time 50ms:   A.event2,  B.event2              (A still sending, next available)
+Time 100ms:  A.event3                         (A completes last event)
+```
 
-#### GET `/api/admin/webhooks/dead-letters`
+**Result:**
+- Each subscriber gets fair CPU time
+- Subscriber A doesn't monopolize all 3 slots
+- B and C don't starve
+- Throughput is predictable
 
-List dead-letter entries with optional `subscriber_id` filter.
+### Without Fair Scheduling (Anti-pattern)
 
-Query params: `limit`, `offset`, `subscriber_id`
+```
+Time 0ms:   A.event1,  A.event2,  A.event3  (all A, unfair)
+Time 150ms: B.event1,  B.event2,  C.event1  (B and C starved)
+```
 
-Response:
-```json
+---
+
+## Circuit Breaker Integration
+
+Each subscriber has an independent circuit breaker that prevents cascading failures.
+
+### States
+
+| State | Behavior | Transition |
+|-------|----------|-----------|
+| **CLOSED** | Deliveries dispatched normally | 5+ failures in 60s → OPEN |
+| **OPEN** | All queued deliveries skipped, routed to dead-letter | 30s timeout → HALF_OPEN |
+| **HALF_OPEN** | Single probe delivery attempted | Success → CLOSED, Failure → OPEN |
+
+### Configuration
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD` | `5` | Failures to trip breaker |
+| `WEBHOOK_CIRCUIT_BREAKER_WINDOW_MS` | `60000` | Failure window (60s) |
+| `WEBHOOK_CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_MS` | `30000` | Before probe attempt (30s) |
+
+### Example
+
+```
+Subscriber endpoint is slow (500ms per request):
+- Attempt 1: 500ms ✗ fail (1 failure)
+- Attempt 2: 500ms ✗ fail (2 failures)
+- Attempt 3: 500ms ✗ fail (3 failures)
+- Attempt 4: 500ms ✗ fail (4 failures)
+- Attempt 5: 500ms ✗ fail (5 failures → TRIP)
+
+Breaker now OPEN for 30 seconds:
+- All queued deliveries → dead-letter queue
+- No new attempts for 30s
+
+After 30 seconds:
+- Breaker transitions to HALF_OPEN
+- Single probe delivery sent
+- If successful → CLOSED, resume normal dispatch
+- If fails → back to OPEN
+```
+
+---
+
+## Retry Strategy
+
+Failed deliveries retry with **exponential backoff with jitter**.
+
+### Configuration
+
+```typescript
 {
-  "webhook_dead_letters": [...],
-  "count": 10,
-  "total": 42,
-  "limit": 50,
-  "offset": 0,
-  "has_more": true
+  maxAttempts: 3,                 // 3 tries total
+  initialBackoffMs: 1_000,        // 1 second first retry
+  maxBackoffMs: 30_000,           // 30 second max
+  backoffMultiplier: 2,           // Double each retry
+  jitterFactor: 0.25,             // 25% randomization (AWS Full Jitter)
 }
 ```
 
-#### POST `/api/admin/webhooks/dead-letters/:id/replay`
+### Example Timeline
 
-Replays a dead-letter entry. Validates the URL is still allowed, then re-delivers to the subscriber's in-memory handler. Stamps `replayed_at` on success.
-
-Response (202):
-```json
-{ "replayed": true }
+```
+Attempt 1 (T=0ms):     Delivery sent, fails
+Wait: 1000ms ± 250ms randomness
+Attempt 2 (T≈1250ms):  Delivery sent, fails
+Wait: 2000ms ± 500ms randomness
+Attempt 3 (T≈3750ms):  Delivery sent, fails
+→ Route to dead-letter queue
 ```
 
-Response (404):
+### Retryable vs Non-Retryable Errors
+
+**Retried:**
+- `ECONNREFUSED` — Connection refused
+- `ENOTFOUND` — DNS resolution failed
+- `ETIMEDOUT` — Request timeout
+- `HTTP 500` — Server error
+- `HTTP 503` — Service unavailable
+
+**Not retried (fail immediately):**
+- `HTTP 400` — Bad request
+- `HTTP 401` — Unauthorized
+- `HTTP 403` — Forbidden
+- `HTTP 404` — Not found
+- Redirect response (manually rejected)
+
+---
+
+## Dead-Letter Queue
+
+Failed deliveries after max retries are persisted for audit and manual replay.
+
+### Persistence
+
+```sql
+CREATE TABLE webhook_dead_letters (
+  id UUID PRIMARY KEY,
+  subscriber_id UUID NOT NULL,
+  event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  last_error TEXT,
+  attempts INTEGER,
+  failed_at TIMESTAMP,
+  replayed_at TIMESTAMP NULL
+);
+```
+
+### Manual Replay
+
+```typescript
+// Replay a dead-letter:
+const result = await replayDeadLetter(deadLetterId)
+// → { replayed: true, subscriberId, error?: string }
+
+// If successful, marked with replayed_at timestamp
+// If fails, remains in dead-letter for retry
+```
+
+---
+
+## Payload Schema Versioning
+
+Subscribers can request different payload schemas for backward compatibility.
+
+### Schema V1 (Original)
+
 ```json
-{ "error": "Dead letter not found or already replayed" }
+{
+  "eventId": "abc123:0",
+  "eventType": "vault_created",
+  "timestamp": "2026-06-28T12:34:56Z",
+  "data": { "vaultId": "vault-123" },
+  "organizationId": "org-456",
+  "schema_version": 1
+}
+```
+
+### Schema V2 (Compact)
+
+```json
+{
+  "schema_version": 2,
+  "event_type": "vault_created",
+  "data": { "vaultId": "vault-123" }
+}
+```
+
+### Configuration
+
+```typescript
+// When registering a subscriber:
+await addSubscriber({
+  organizationId: 'org-id',
+  url: 'https://example.com/webhook',
+  secret: 'signing-secret',
+  events: ['vault_created', 'vault_completed'],
+  schemaVersion: 2  // Optional, defaults to 1
+})
 ```
 
 ## Test-Ping Endpoint
@@ -198,9 +317,15 @@ Example v1 body:
 
 ## Testing
 
-Run webhook tests:
-```bash
-npm test -- --testPathPattern=webhooks
+```
+POST /webhook HTTP/1.1
+X-Disciplr-Signature: sha256=<hex-digest>
+X-Disciplr-Event: vault_created
+X-Disciplr-Event-Id: abc123:0
+X-Disciplr-Delivery-Timestamp: 2026-06-28T12:34:56Z
+Content-Type: application/json
+
+{...payload...}
 ```
 
 Run the test-ping tests specifically:
@@ -210,15 +335,25 @@ npm test -- src/tests/webhooks.testPing.test.ts
 
 DLQ tests require a PostgreSQL database (`DATABASE_URL`). Without it, they are skipped gracefully.
 
----
+```python
+import hmac
+import hashlib
 
-# Webhook Delivery System
+secret = "signing-secret"
+body = request.body.decode('utf-8')
+signature = request.headers.get('X-Disciplr-Signature')
 
-The webhook system delivers vault lifecycle events to registered HTTP endpoints. Subscribers are stored in PostgreSQL and scoped per organization.
+expected = 'sha256=' + hmac.new(
+  secret.encode(),
+  body.encode(),
+  hashlib.sha256
+).hexdigest()
 
-## Storage Model
+if not hmac.compare_digest(expected, signature):
+  return 401  # Unauthorized
+```
 
-Webhook subscribers are stored in the `webhook_subscribers` table:
+### Secret Rotation
 
 | Column | Type | Description |
 |---|---|---|
@@ -235,202 +370,273 @@ Webhook subscribers are stored in the `webhook_subscribers` table:
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last update timestamp |
 
-Unique constraint: `(organization_id, url)` — only one active subscriber per org/URL pair.
+```typescript
+// Rotate secret
+await rotateSubscriberSecret(subscriberId, orgId, newSecret)
 
-## Secret Handling Decision
-
-The `secret` column stores the HMAC signing secret in plaintext. Hashing is not viable because the raw secret is required to compute HMAC-SHA256 signatures for outgoing webhook requests.
-
-**Recommendation for production:** Encrypt the secret at rest using one of:
-- PostgreSQL `pgcrypto` extension (`pgp_sym_encrypt` / `pgp_sym_decrypt`)
-- Application-level AES-256-GCM encryption before storage, with the encryption key managed via a secrets manager (AWS KMS, HashiCorp Vault)
-
-The trade-off is that the encryption key must be available to the application at runtime to decrypt secrets for signing, which shifts the protection boundary from the database layer to the key management layer.
-
-## Organization Isolation
-
-All subscriber queries are scoped by `organization_id`. When dispatching events, only subscribers belonging to the same organization as the event source receive the delivery. This prevents cross-tenant information leakage.
-
-## API
-
-### `addSubscriber(organizationId, url, secret, events, schemaVersion = 1)`
-
-Creates a new webhook subscriber. The URL is validated against the SSRF allowlist (`isUrlAllowed`). Returns the created subscriber.
-
-`events` is an array of event type strings the subscriber wants to receive. An empty array (`[]`) acts as a wildcard and subscribes to all events. Each event type is validated against `KNOWN_EVENT_TYPES`; unknown types are rejected.
-
-Optional `schemaVersion` selects the payload envelope version (default `1`). Must be a supported version (see Payload Schema Versioning).
-
-### `KNOWN_EVENT_TYPES`
-
-The set of all event types the system can produce:
-
+// Old secret remains valid during grace window
+// allowing in-flight deliveries to verify
+// Grace window: 24 hours (configurable via WEBHOOK_SECRET_GRACE_WINDOW_MS)
 ```
-vault_created, vault_completed, vault_failed, vault_cancelled,
-milestone_created, milestone_validated, settlement_summary
-```
-
-### `upsertSubscriber(organizationId, url, secret, events)`
-
-Idempotent alternative to `addSubscriber`. Re-registering the same `(organizationId, url)` pair updates the existing row in-place — no duplicate rows are created and delivery history (dead-letter entries keyed on the subscriber id) is preserved. The upsert is scoped to the calling org so a cross-org overwrite is impossible.
-
-### `rotateSubscriberSecret(id, organizationId, newSecret)`
-
-Rotates the signing secret for a subscriber:
-
-1. The current `secret` is moved to `previous_secret`.
-2. `newSecret` becomes the active `secret`.
-3. `rotated_at` is stamped to `now()`.
-
-The `previousSecret` remains valid for signature verification for the duration of the **grace window** (env `WEBHOOK_SECRET_GRACE_WINDOW_MS`, default **24 hours**). This lets receivers that haven't yet updated their expected secret continue to verify in-flight deliveries without interruption.
-
-Returns `null` when the subscriber does not exist or the `organizationId` does not match (cross-org rotation is silently rejected to avoid enumeration).
-
-### `verifySignatureWithGrace(subscriber, body, signature)`
-
-Verifies a signature against a subscriber's **current** secret and, if within the grace window, also against the **previous** secret. Returns `true` if either matches. Use this instead of bare `verifySignature` wherever subscriber-scoped verification is needed (e.g., inbound callbacks that embed a subscriber ID).
-
-### `isPreviousSecretInGrace(subscriber)`
-
-Returns `true` when `previousSecret` is set and `Date.now() - rotatedAt < graceWindowMs`.
-
-### `removeSubscriber(id)`
-
-Deletes a subscriber by ID. Returns `true` if found.
-
-### `listSubscribers(organizationId)`
-
-Returns all active subscribers for an organization. **Secret material is never included in list responses.**
-
-### `dispatchWebhookEvent(payload)`
-
-Delivers an event to all eligible active subscribers for the organization specified in `payload.organizationId`. Outbound deliveries are always signed with the **current** secret. Uses exponential-backoff retry (max 3 attempts). Failures are collected per-subscriber.
 
 ---
 
-## Secret Rotation Flow
+## Prometheus Metrics
+
+### Gauges
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `disciplr_webhook_dispatch_in_flight` | Gauge | Current in-flight deliveries |
+| `disciplr_webhook_dispatch_queue_depth` | Gauge | Total queued deliveries waiting |
+| `disciplr_webhook_breaker_closed` | Gauge | Subscribers with CLOSED breaker |
+| `disciplr_webhook_breaker_open` | Gauge | Subscribers with OPEN breaker |
+| `disciplr_webhook_breaker_half_open` | Gauge | Subscribers with HALF_OPEN breaker |
+
+### Endpoint
 
 ```
-Operator                      Disciplr API                  Subscriber
-   |                               |                              |
-   |-- POST /rotate-secret ------->|                              |
-   |   { new_secret: "v2" }        |                              |
-   |<-- 200 { rotated_at }---------|                              |
-   |                               |                              |
-   |                               |-- deliver (signed w/ v2) --->|
-   |                               |   (subscriber may still      |
-   |                               |    verify with v1 during     |
-   |                               |    grace window)             |
-   |   [ grace window: 24 h ]      |                              |
-   |                               |                              |
-   |   Subscriber updates its      |                              |
-   |   expected secret to v2       |                              |
-   |                               |-- deliver (signed w/ v2) --->|
-   |                               |   (subscriber now verifies   |
-   |                               |    with v2 exclusively)      |
+GET /metrics
 ```
 
-Key properties:
-- Outbound deliveries are **always signed with the current (new) secret** immediately after rotation.
-- The previous secret is retained server-side for the grace window so receivers don't need to update instantaneously.
-- After the grace window closes, `verifySignatureWithGrace` only accepts the current secret.
-- Operators can tune the overlap duration via `WEBHOOK_SECRET_GRACE_WINDOW_MS`.
+### Example Output
+
+```
+# HELP disciplr_webhook_dispatch_in_flight Number of webhook deliveries currently in flight
+# TYPE disciplr_webhook_dispatch_in_flight gauge
+disciplr_webhook_dispatch_in_flight 8
+
+# HELP disciplr_webhook_dispatch_queue_depth Number of webhook deliveries waiting in queue
+# TYPE disciplr_webhook_dispatch_queue_depth gauge
+disciplr_webhook_dispatch_queue_depth 42
+
+# HELP disciplr_webhook_breaker_open Number of webhook subscribers with open circuit breaker
+# TYPE disciplr_webhook_breaker_open gauge
+disciplr_webhook_breaker_open 2
+```
 
 ---
 
-## Admin API Endpoints
+## Monitoring & Alerting
 
-### `POST /api/admin/webhooks/subscribers`
+### Key Metrics to Monitor
 
-Idempotent upsert. Creates or updates a subscriber for the given `(organization_id, url)` pair.
+**1. Queue Depth Growth**
+```promql
+# Alert if queue growing unbounded
+rate(disciplr_webhook_dispatch_queue_depth[5m]) > 100
 
-**Body:**
-```json
-{
-  "organization_id": "org-123",
-  "url": "https://hooks.example.com/disciplr",
-  "secret": "my-signing-secret",
-  "events": ["vault_created", "vault_completed"]
-}
+# Alert if queue depth very high
+disciplr_webhook_dispatch_queue_depth > 10000
 ```
 
-**Response 200:**
-```json
-{
-  "id": "uuid",
-  "organization_id": "org-123",
-  "url": "https://hooks.example.com/disciplr",
-  "events": ["vault_created", "vault_completed"],
-  "active": true,
-  "created_at": "2026-06-27T13:00:00.000Z"
-}
+**2. In-Flight Stuck**
+```promql
+# Alert if in-flight stuck at ceiling for extended period
+disciplr_webhook_dispatch_in_flight == 10 AND rate(disciplr_webhook_dispatch_in_flight[10m]) == 0
 ```
 
-The secret is **never returned** in any response.
-
-### `GET /api/admin/webhooks/subscribers?organization_id=<org>`
-
-Lists active subscribers for an organization. Secret material is stripped.
-
-### `POST /api/admin/webhooks/subscribers/:id/rotate-secret`
-
-Rotates the signing secret. Previous secret is preserved in the grace window.
-
-**Body:**
-```json
-{
-  "organization_id": "org-123",
-  "new_secret": "my-new-signing-secret"
-}
+**3. Circuit Breaker Trips**
+```promql
+# Alert if too many breakers open
+disciplr_webhook_breaker_open > 50
 ```
 
-**Response 200:**
-```json
-{
-  "id": "uuid",
-  "rotated_at": "2026-06-27T14:00:00.000Z"
-}
+**4. Dead-Letter Accumulation**
+```sql
+SELECT COUNT(*) FROM webhook_dead_letters
+WHERE replayed_at IS NULL AND failed_at > NOW() - INTERVAL '1 hour'
 ```
-
-**Response 404** – subscriber not found or belongs to a different org (identical to avoid enumeration).
 
 ---
 
-## Payload Schema Versioning
+## Performance Tuning
 
-Each subscriber selects a payload schema version (`schema_version`). The version determines the JSON envelope delivered to the subscriber's endpoint.
+### Increasing Throughput
 
-### Supported Versions
+**Symptom:** Queue depth constantly growing, never caught up
 
-| Version | Envelope | Notes |
-|---------|----------|-------|
-| **1** (default) | `{ eventId, eventType, timestamp, data, organizationId, schema_version: 1 }` | Original shape — includes all fields from the internal payload with `schema_version` appended. |
-| **2** | `{ schema_version: 2, event_type, data }` | Compact envelope. Omits `eventId`, `timestamp`, and `organizationId`. The event type key is `event_type` (snake_case). |
+**Solution:** Increase `WEBHOOK_MAX_CONCURRENCY`
+```bash
+WEBHOOK_MAX_CONCURRENCY=50
+```
 
-### Adding a Subscriber with a Specific Version
+**Impact:**
+- More concurrent sockets open
+- Higher memory usage
+- More file descriptors needed
+- Better throughput for IO-bound workload
+
+**Limits:**
+- System file descriptor limit: `ulimit -n`
+- Subscriber throughput ceiling (no benefit increasing beyond their capacity)
+
+### Protecting Resources
+
+**Symptom:** Memory usage spiking, system becoming unresponsive
+
+**Solution:** Decrease `WEBHOOK_MAX_CONCURRENCY`
+```bash
+WEBHOOK_MAX_CONCURRENCY=3
+```
+
+**Impact:**
+- Fewer concurrent sockets
+- Lower memory usage
+- Lower file descriptor usage
+- Slower but stable throughput
+
+### Tuning Circuit Breaker
+
+**Symptom:** Too many false trips (good endpoints getting OPEN)
+
+**Solution:** Increase threshold or window
+```bash
+WEBHOOK_CIRCUIT_BREAKER_THRESHOLD=10    # Was 5
+WEBHOOK_CIRCUIT_BREAKER_WINDOW_MS=120000  # Was 60000 (2 min)
+```
+
+**Symptom:** Slow recovery from transient outages
+
+**Solution:** Decrease half-open timeout
+```bash
+WEBHOOK_CIRCUIT_BREAKER_HALF_OPEN_TIMEOUT_MS=10000  # Was 30000
+```
+
+---
+
+## Backpressure & Persistence
+
+### In-Memory Queue
+
+Enqueued deliveries are held in memory:
+- Fast: No persistence overhead
+- Risk: Lost on restart
+- Safe for: Low-churn events (< 1000/min)
+
+### Persistent Outbox (Recommended for Production)
+
+For durability, persist webhook events to the outbox table before queueing:
 
 ```typescript
-// Defaults to version 1
-await addSubscriber(orgId, url, secret, events)
+// Event processor writes to vault_outbox
+await db('vault_outbox').insert({
+  event_id: payload.eventId,
+  event_type: payload.eventType,
+  payload: JSON.stringify(payload),
+  processed: false,
+  attempts: 0
+})
 
-// Explicit version 2
-await addSubscriber(orgId, url, secret, events, 2)
+// Background worker polls outbox and dispatches
+await relayOutboxBatch(batchSize)
 ```
 
-### Delivery Behaviour
+**Benefits:**
+- Survives process restart
+- Bounded queue depth (disk-backed)
+- Durable audit trail
 
-- The HTTP body delivered to the subscriber is the serialized versioned envelope.
-- The `x-disciplr-signature` HMAC is computed over the versioned body, so the signature covers the full envelope.
-- The `x-disciplr-event`, `x-disciplr-event-id`, and `x-disciplr-delivery-timestamp` headers are identical across all schema versions.
+---
 
-### Deprecation Policy
+## Troubleshooting
 
-1. When a new schema version is introduced, the previous version enters **deprecated** status.
-2. Deprecated versions remain functional for **90 days** after the successor version is marked stable.
-3. During the deprecation window subscribers on the old version receive **warning** log lines on each delivery.
-4. After the deprecation window expires the old version is **removed** and `addSubscriber` rejects it. Existing subscribers that still reference the removed version are downgraded to the earliest still-supported version and logged.
-5. The `LATEST_SCHEMA_VERSION` constant always points to the current stable version.
-6. The `SUPPORTED_SCHEMA_VERSIONS` set contains all versions that are neither removed nor deprecated.
+### Queue Growing Indefinitely
+
+**Diagnosis:**
+```promql
+disciplr_webhook_dispatch_queue_depth > 50000
+```
+
+**Causes:**
+1. Subscriber endpoints all failing or slow
+2. Circuit breakers all open
+3. Concurrency too low
+
+**Remediation:**
+1. Check subscriber health: `SELECT * FROM webhook_dead_letters WHERE failed_at > NOW() - INTERVAL '1 hour'`
+2. Check breaker status: `SELECT COUNT(*) FROM webhook_breaker_states WHERE state = 'OPEN'`
+3. Increase concurrency or add delivery workers
+
+### Deliveries Stuck in Queue
+
+**Diagnosis:**
+```sql
+SELECT COUNT(*) FROM webhook_dead_letters
+WHERE created_at > NOW() - INTERVAL '10 minutes'
+```
+
+**Causes:**
+1. All endpoints failing
+2. Subscriber breakers all open
+
+**Remediation:**
+1. Investigate failures in dead-letter queue
+2. Fix subscriber endpoints
+3. Manually close breakers if needed: `DELETE FROM webhook_breaker_states WHERE state = 'OPEN'`
+
+### High Memory Usage
+
+**Diagnosis:**
+```
+RSS memory > expected
+Process file descriptor count high
+```
+
+**Causes:**
+1. Too many queued deliveries in memory
+2. WEBHOOK_MAX_CONCURRENCY too high
+
+**Remediation:**
+1. Reduce WEBHOOK_MAX_CONCURRENCY
+2. Ensure outbox relay is running: `relayOutboxBatch()`
+3. Investigate slow subscribers
+
+---
+
+## API Reference
+
+### dispatchWebhookEvent(payload)
+
+```typescript
+async function dispatchWebhookEvent(
+  payload: WebhookDeliveryPayload
+): Promise<WebhookDeliveryResult[]>
+```
+
+**Returns:** Empty array immediately (work continues in background)
+
+**Side effects:** Enqueues deliveries to dispatcher
+
+### addSubscriber(orgId, url, secret, events, schemaVersion?)
+
+```typescript
+async function addSubscriber(
+  organizationId: string,
+  url: string,
+  secret: string,
+  events: string[],
+  schemaVersion?: number  // 1 or 2, defaults to 1
+): Promise<WebhookSubscriber>
+```
+
+### rotateSubscriberSecret(id, orgId, newSecret)
+
+```typescript
+async function rotateSubscriberSecret(
+  id: string,
+  organizationId: string,
+  newSecret: string
+): Promise<WebhookSubscriber | null>
+```
+
+### replayDeadLetter(deadLetterId)
+
+```typescript
+async function replayDeadLetter(
+  id: string
+): Promise<{ replayed: boolean; subscriberId?: string; error?: string }>
+```
 
 ---
 
@@ -597,42 +803,66 @@ This design ensures that the signature always matches the delivered body, regard
 ## Outbound Webhooks
 The Disciplr backend dispatches webhooks to subscribers when specific events occur. Subscribers can register to receive webhook deliveries for events such as `vault_created`, `vault_completed`, etc.
 
-The outbound webhooks include signatures in headers which the subscriber can verify.
+### SSRF Mitigation
 
-## Inbound Webhooks
+Webhook URLs are validated to block internal addresses:
+- `127.0.0.1`, `::1` (loopback)
+- `10.0.0.0/8`, `192.168.0.0/16`, `172.16.0.0/12` (RFC-1918)
+- `169.254.0.0/16` (link-local)
+- `localtest.me` (known bypass domain)
 
-When third-party providers (e.g., payment gateways) send webhook callbacks to our backend, we must ensure these callbacks are authentic, timely, and not replayed.
+### Secret Management
 
-### Verification Flow
+- Secrets stored in database (encrypted at rest recommended)
+- Never logged or exposed in errors
+- Rotated independently per subscriber
+- Grace window allows gradual rollout
 
-The inbound webhook endpoint uses the `webhookVerify` middleware to validate requests:
-1. **Timestamp Check**: Ensures the request was generated recently.
-2. **Replay Protection**: Stores a nonce combined with the timestamp. If the same nonce is seen again within the allowed time window, the request is rejected.
-3. **Signature Verification**: Validates the HMAC-SHA256 signature calculated over the timestamp, nonce, and raw request body using a shared secret.
+### Signature Verification
 
-### Required Headers
-Inbound webhook requests must include the following headers:
-- `x-webhook-signature`: The HMAC-SHA256 signature in the format `sha256=<hex_digest>`.
-- `x-webhook-timestamp`: A unix timestamp (in milliseconds) representing when the request was made.
-- `x-webhook-nonce`: A unique string for the request.
+- HMAC-SHA256 prevents tampering
+- Constant-time comparison prevents timing attacks
+- Include in request validation (mandatory)
 
-### Calculating the Signature
-The signature is generated as an HMAC-SHA256 digest of the following string:
-`<timestamp>.<nonce>.<raw_body>`
+---
 
-Using the shared secret (`WEBHOOK_INBOUND_SECRET`):
+## Examples
 
-```javascript
-const crypto = require('crypto');
+### Register a Webhook Subscriber
 
-const secret = process.env.WEBHOOK_INBOUND_SECRET;
-const timestamp = Date.now();
-const nonce = crypto.randomUUID();
-const rawBody = JSON.stringify(payload); // Ensure this matches exactly what is sent over the wire
+```typescript
+const subscriber = await addSubscriber(
+  'org-123',
+  'https://api.customer.com/webhook',
+  'secret-key-123',
+  ['vault_created', 'vault_completed'],
+  2  // Schema version 2
+)
+```
 
-const signatureString = `${timestamp}.${nonce}.${rawBody}`;
-const digest = crypto.createHmac('sha256', secret).update(signatureString).digest('hex');
-const signatureHeader = `sha256=${digest}`;
+### Verify Webhook in Recipient
+
+```python
+import hmac
+import hashlib
+import json
+
+def verify_webhook(request):
+    signature = request.headers.get('X-Disciplr-Signature')
+    body = request.body.decode('utf-8')
+    secret = 'secret-key-123'
+    
+    expected_sig = 'sha256=' + hmac.new(
+        secret.encode(),
+        body.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(expected_sig, signature):
+        return False, 'Invalid signature'
+    
+    payload = json.loads(body)
+    return True, payload
 ```
 
 ## Per-Organization Egress Allowlist

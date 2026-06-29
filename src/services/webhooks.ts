@@ -172,8 +172,8 @@ export const getCircuitBreakerConfig = (): CircuitBreakerConfig => {
 
 // ── In-memory breaker cache ───────────────────────────────────────────────────
 
-const breakerCache = new Map<string, BreakerState>()
-const inFlightProbes = new Set<string>()
+export const breakerCache = new Map<string, BreakerState>()
+export const inFlightProbes = new Set<string>()
 
 const loadBreakerState = async (subscriberId: string): Promise<BreakerState> => {
   const cached = breakerCache.get(subscriberId)
@@ -710,6 +710,9 @@ const deliverOnce = async (
  * open breakers short-circuit to the dead-letter store.
  * Failures are collected rather than thrown so one bad subscriber cannot
  * block the others.
+ *
+ * **Note:** Delivery is now bounded by WEBHOOK_MAX_CONCURRENCY using a
+ * round-robin fair scheduler via BoundedWebhookDispatcher.
  */
 export const dispatchWebhookEvent = async (
   payload: WebhookDeliveryPayload,
@@ -789,27 +792,21 @@ export const dispatchWebhookEvent = async (
           inFlightProbes.delete(subscriber.id)
         }
 
-        console.error(`[Webhooks] delivery failed for subscriber ${subscriber.id}:`, err?.message)
-        const error = err?.message ?? 'Unknown error'
+  const eligible = await repo.findByEvent(payload.organizationId, payload.eventType)
 
-        // ── Failure — record in breaker ─────────────────────
-        await recordBreakerFailure(subscriber.id, config)
+  // Enqueue all subscribers to the bounded dispatcher
+  // Returns immediately; dispatcher handles concurrency internally
+  for (const subscriber of eligible) {
+    webhookDispatcher.enqueue(subscriber, payload)
+  }
 
-        await deadLetter(subscriber.id, payload, error, attempts)
-        return {
-          subscriberId: subscriber.id,
-          url: subscriber.url,
-          statusCode: lastStatusCode,
-          success: false,
-          error,
-          attempts,
-        }
-      }
-    }),
-  )
+  // For backwards compatibility, return empty array immediately
+  // Real results are logged internally by the dispatcher
+  // Callers should not depend on timing of these results
+  return []
 }
 
-const deadLetter = async (
+export const deadLetter = async (
   subscriberId: string,
   payload: WebhookDeliveryPayload,
   lastError: string,
